@@ -76,32 +76,3 @@ Warm and ask:
 flume warm <pack_id>
 flume ask <pack_id> "What are the refund rules?"
 ```
-
-## What V0 Implements
-
-- Deterministic context pack compilation.
-- Stable document/chunk ordering and prompt rendering.
-- Model, tokenizer, tenant, template, document, and token fingerprints.
-- SQLite metadata store.
-- vLLM OpenAI-compatible completion proxy.
-- Streaming and non-streaming answer path.
-- Pack-aware worker affinity.
-- Warmup endpoint for populating vLLM prefix cache.
-- Prometheus metrics.
-- Benchmark scaffolding and report storage.
-
-## What V0 Does Not Implement
-
-- Custom KV tensor storage.
-- Non-prefix KV reuse.
-- Vector search.
-- Kafka or Arrow Flight ingestion.
-- Distributed KV cache.
-- SGLang or LMCache integration.
-
-## Honest Benchmark Goal
-
-Flume should show measurable TTFT reduction on repeated long-context workloads
-when compared against plain vLLM. It must also compare honestly against vLLM APC
-alone, because Flume's V0 value is cache-stable prompt construction, warmup,
-worker affinity, and observability, not a new KV-cache kernel.
