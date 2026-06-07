@@ -1,0 +1,51 @@
+services:
+  flume:
+    build: .
+    environment:
+      FLUME_DATABASE_URL: sqlite:////data/flume.db
+      FLUME_VLLM_WORKERS: http://vllm:8000
+      FLUME_MODEL_ID: meta-llama/Llama-3.1-8B-Instruct
+      FLUME_TOKENIZER_ID: meta-llama/Llama-3.1-8B-Instruct
+    ports:
+      - "8080:8080"
+    volumes:
+      - flume-data:/data
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    command:
+      - --model
+      - meta-llama/Llama-3.1-8B-Instruct
+      - --enable-prefix-caching
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  flume-data:

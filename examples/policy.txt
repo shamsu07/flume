@@ -1,0 +1,6 @@
+Refund Policy
+
+Customers can request a refund within 30 days of purchase if the product has not
+been activated. Enterprise contracts may define stricter refund terms in their
+order form. Support agents must verify tenant, invoice, and activation status
+before approving a refund.
