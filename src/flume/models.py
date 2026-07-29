@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from string import Formatter
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from flume.hashing import canonical_identifier, canonical_json_value, canonical_text
 
 
 def utc_now() -> datetime:
@@ -17,39 +20,94 @@ class OrderPolicy(StrEnum):
 
 
 class DocumentChunk(BaseModel):
-    doc_id: str
-    chunk_id: str = "0"
-    version: str = "1"
+    doc_id: str = Field(min_length=1, max_length=512)
+    chunk_id: str = Field(default="0", min_length=1, max_length=512)
+    version: str = Field(default="1", min_length=1, max_length=512)
     text: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
 
     @field_validator("doc_id", "chunk_id", "version")
     @classmethod
     def non_empty(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("value cannot be empty")
-        return value
+        return canonical_identifier(value)
+
+    @field_validator("text")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        return canonical_text(value)
+
+    @field_validator("metadata")
+    @classmethod
+    def normalize_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        normalized = canonical_json_value(value)
+        if not isinstance(normalized, dict):
+            raise TypeError("metadata must be an object")
+        return normalized
 
 
 class PackCreateRequest(BaseModel):
-    tenant_id: str = "default"
-    model_id: str
-    tokenizer_id: str
-    template_id: str = "default-rag-v1"
-    chunks: list[DocumentChunk]
+    tenant_id: str = Field(default="default", min_length=1, max_length=128)
+    model_id: str = Field(min_length=1, max_length=512)
+    tokenizer_id: str = Field(min_length=1, max_length=512)
+    template_id: str = Field(default="default-rag-v1", min_length=1, max_length=128)
+    chunks: list[DocumentChunk] = Field(min_length=1)
     template: str | None = None
     order_policy: OrderPolicy = OrderPolicy.stable
-    ttl_seconds: int | None = None
+    ttl_seconds: int | None = Field(default=None, gt=0)
     tags: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("chunks")
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("tenant_id", "model_id", "tokenizer_id", "template_id")
     @classmethod
-    def require_chunks(cls, value: list[DocumentChunk]) -> list[DocumentChunk]:
-        if not value:
-            raise ValueError("at least one chunk is required")
-        return value
+    def normalize_identifiers(cls, value: str) -> str:
+        return canonical_identifier(value)
+
+    @field_validator("template")
+    @classmethod
+    def validate_template(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = canonical_text(value)
+        fields: list[tuple[str, str, str | None]] = []
+        try:
+            for _, field_name, format_spec, conversion in Formatter().parse(normalized):
+                if field_name is not None:
+                    fields.append((field_name, format_spec, conversion))
+        except ValueError as exc:
+            raise ValueError("template contains invalid formatting syntax") from exc
+        if fields != [("context", "", None)]:
+            raise ValueError("template must contain exactly one unmodified {context} field")
+        return normalized
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_tags(cls, value: list[str]) -> list[str]:
+        normalized = [canonical_identifier(tag) for tag in value]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("tags must be unique")
+        return sorted(normalized)
+
+    @field_validator("metadata")
+    @classmethod
+    def normalize_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        normalized = canonical_json_value(value)
+        if not isinstance(normalized, dict):
+            raise TypeError("metadata must be an object")
+        return normalized
+
+    @model_validator(mode="after")
+    def reject_duplicate_chunks(self) -> PackCreateRequest:
+        seen: set[tuple[str, str]] = set()
+        for chunk in self.chunks:
+            key = (chunk.doc_id, chunk.chunk_id)
+            if key in seen:
+                raise ValueError(f"duplicate chunk key: {chunk.doc_id}/{chunk.chunk_id}")
+            seen.add(key)
+        return self
 
 
 class ContextPack(BaseModel):
