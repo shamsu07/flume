@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "benchmark": "local_proxy_overhead",
+  "environment": {
+    "timestamp_utc": "2026-07-29T15:10:38.102769+00:00",
+    "hostname": "macpro",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.12.13",
+    "logical_cpu_count": 15,
+    "git": {
+      "commit": "5b3dd47a9320af1ad267c5f92fe6683eb1e59d48",
+      "dirty": true,
+      "branch": "codex/bench-ops"
+    }
+  },
+  "configuration": {
+    "requests_per_path": 1000,
+    "concurrency": 32,
+    "warmup_requests_per_path": 25,
+    "timeout_seconds": 30.0,
+    "embedded_proxy": true,
+    "mock_upstream": true,
+    "proxy_api_mode": "legacy"
+  },
+  "measurements": {
+    "direct": {
+      "requests": 1000,
+      "errors": 0,
+      "duration_seconds": 1.5678627500019502,
+      "throughput_rps": 637.8109308348298,
+      "p50_ms": 36.9070835004095,
+      "p95_ms": 134.66514824831393,
+      "p99_ms": 205.02366425032957,
+      "minimum_ms": 5.650750012136996,
+      "maximum_ms": 274.0782080218196
+    },
+    "proxy": {
+      "requests": 1000,
+      "errors": 0,
+      "duration_seconds": 8.70450004201848,
+      "throughput_rps": 114.88310588463283,
+      "p50_ms": 195.4635624861112,
+      "p95_ms": 566.1399267555678,
+      "p99_ms": 1123.851533642155,
+      "minimum_ms": 139.90229199407622,
+      "maximum_ms": 2653.7800840160344
+    }
+  },
+  "comparison": {
+    "incremental_p50_ms": 158.5564789857017,
+    "incremental_p95_ms": 431.47477850725386,
+    "incremental_p99_ms": 918.8278693918253,
+    "throughput_ratio": 0.18012094232104567
+  },
+  "mock_upstream_counts": {
+    "health": 1000,
+    "completions": 2000
+  }
+}

@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from flume.config import Settings
-from flume.models import BenchmarkRunRequest, PackCreateRequest
+from flume.models import PackCreateRequest
 from flume.sdk import FlumeClient, chunks_from_files
 
 app = typer.Typer(help="Flume RAG cache compiler and vLLM proxy.")
@@ -126,40 +126,6 @@ def stats(
 ) -> None:
     response = FlumeClient(api).cache_stats()
     console.print(response.model_dump_json(indent=2))
-
-
-@app.command()
-def bench(
-    api: Annotated[str, typer.Option(help="Flume API URL.")] = "http://localhost:8080",
-    baseline: Annotated[str, typer.Option(help="Benchmark baseline name.")] = "flume_warm_affinity",
-    context_length: Annotated[
-        list[int] | None,
-        typer.Option(help="Context length to test."),
-    ] = None,
-    iterations: Annotated[int, typer.Option(help="Iterations per context length.")] = 3,
-) -> None:
-    request = BenchmarkRunRequest(
-        baseline=baseline,  # type: ignore[arg-type]
-        context_lengths=context_length or [4096, 16384],
-        iterations=iterations,
-    )
-    run = FlumeClient(api).run_benchmark(request)
-    console.print(run.model_dump_json(indent=2))
-
-
-@app.command()
-def report(
-    api: Annotated[str, typer.Option(help="Flume API URL.")] = "http://localhost:8080",
-) -> None:
-    runs = FlumeClient(api).list_benchmarks()
-    table = Table(title="Benchmark Runs")
-    table.add_column("run_id")
-    table.add_column("status")
-    table.add_column("baseline")
-    table.add_column("created_at")
-    for run in runs:
-        table.add_row(run.run_id, run.status, run.request.baseline, str(run.created_at))
-    console.print(table)
 
 
 def main() -> None:

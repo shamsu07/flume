@@ -1,33 +1,49 @@
 services:
   flume:
     build: .
+    init: true
+    restart: unless-stopped
     environment:
       FLUME_DATABASE_URL: sqlite:////data/flume.db
       FLUME_VLLM_WORKERS: http://vllm:8000
       FLUME_MODEL_ID: meta-llama/Llama-3.1-8B-Instruct
       FLUME_TOKENIZER_ID: meta-llama/Llama-3.1-8B-Instruct
+      FLUME_TOKENIZER_REVISION: ${FLUME_TOKENIZER_REVISION:?set an immutable tokenizer revision}
+      FLUME_CACHE_SALT_SECRET: ${FLUME_CACHE_SALT_SECRET:?set a high-entropy cache salt secret}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - flume-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
 
   prometheus:
-    image: prom/prometheus:v2.53.0
+    image: prom/prometheus:v2.53.0@sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
 
   grafana:
-    image: grafana/grafana:11.0.0
+    image: grafana/grafana:11.0.0@sha256:0dc5a246ab16bb2c38a349fb588174e832b4c6c2db0981d0c3e6cd774ba66a54
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
 
   vllm:
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.22.0@sha256:0fec7ec5f3e6bc168e54899935fb0557da908a4832a1dbc88e2debcf2f889416
     profiles: ["gpu"]
     command:
       - --model
@@ -38,7 +54,10 @@ services:
       - --port
       - "8000"
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    ipc: host
+    security_opt:
+      - no-new-privileges:true
     deploy:
       resources:
         reservations:

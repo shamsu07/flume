@@ -66,7 +66,11 @@ class BenchmarkRunner:
                         }
                     )
 
-                latencies = [sample["latency_ms"] for sample in samples]
+                latencies = [
+                    float(sample["latency_ms"])
+                    for sample in samples
+                    if sample["latency_ms"] is not None
+                ]
                 results[str(context_length)] = {
                     "pack_id": pack.pack_id,
                     "worker_url": worker_url,
