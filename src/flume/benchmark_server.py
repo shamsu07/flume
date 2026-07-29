@@ -15,19 +15,30 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 
 def create_mock_worker(worker_id: str, delay_ms: float = 0.0) -> FastAPI:
     app = FastAPI(title=f"Flume benchmark worker {worker_id}")
-    state: dict[str, float | int] = {"completions": 0, "delay_ms": delay_ms}
+    state: dict[str, float | int] = {
+        "completions": 0,
+        "delay_ms": delay_ms,
+        "health_checks": 0,
+        "metrics_scrapes": 0,
+    }
 
     @app.get("/health")
     async def health() -> dict[str, str]:
+        state["health_checks"] += 1
         return {"status": "ok"}
 
     @app.get("/metrics", response_class=PlainTextResponse)
     async def metrics() -> PlainTextResponse:
+        state["metrics_scrapes"] += 1
         return PlainTextResponse(
             "flume_benchmark_synthetic_prefix_cache_queries "
             f"{state['completions']}\n"
             "flume_benchmark_synthetic_prefix_cache_hits "
             f"{max(0, state['completions'] - 1)}\n"
+            "flume_benchmark_synthetic_health_checks "
+            f"{state['health_checks']}\n"
+            "flume_benchmark_synthetic_metrics_scrapes "
+            f"{state['metrics_scrapes']}\n"
         )
 
     @app.post("/benchmark/control")

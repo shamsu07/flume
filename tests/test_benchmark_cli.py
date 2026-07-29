@@ -660,6 +660,22 @@ def test_subcommands_and_legacy_gpu_invocation(capsys) -> None:
     with pytest.warns(DeprecationWarning):
         assert parse_command_args(gpu_arguments).command == "gpu"
     assert "deprecated" in capsys.readouterr().err
+    gate_args = parse_command_args(
+        [
+            "mac-gate",
+            "--reference-source",
+            "/tmp/reference",
+            "--reference-commit",
+            "abcdef0",
+            "--target-source",
+            "/tmp/target",
+            "--target-commit",
+            "1234567",
+        ]
+    )
+    assert gate_args.command == "mac-gate"
+    assert gate_args.seed == [20260729, 20260730, 20260731]
+    assert gate_args.concurrency == [1, 8, 32]
 
 
 def test_deterministic_local_workload_fixtures() -> None:
