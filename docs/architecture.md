@@ -33,9 +33,9 @@ request path.
 ## Routing policies
 
 `hrw` is the default and always chooses the healthy worker with the highest
-rendezvous score for a pack. The experimental `bounded_hrw` policy preserves
-that worker as the primary while allowing a temporary spill when it is outside
-the configured load bound.
+rendezvous score for a pack. The experimental `bounded_hrw` policy is disabled
+by default. When explicitly enabled, it preserves that worker as the primary
+while allowing a temporary spill when it is outside the configured load bound.
 
 Bounded routing refreshes vLLM running and waiting request gauges in the
 background. Its effective load is:
@@ -52,6 +52,13 @@ local load alone never causes a spill.
 The request path performs no network I/O. Affinity state is bounded by both an
 entry limit and an idle TTL, and worker metrics use hashed worker IDs rather
 than URLs.
+
+Routing state, health, and load snapshots are process-local. Bounded HRW does
+not consume KV-block events, discover remote cache contents, or coordinate
+multiple Flume replicas. It is therefore not equivalent to a distributed
+cache-aware router such as Dynamo, and it does not replace or evaluate LMCache.
+Local mock evidence does not establish that this policy improves real GPU/APC
+performance.
 
 This release is not a distributed control plane. Run one Flume process with one
 SQLite database. PostgreSQL, replicated Flume instances, multi-model discovery,
