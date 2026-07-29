@@ -374,37 +374,3 @@ class StatsResponse(BaseModel):
     workers: list[WorkerStats]
 
     model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-# Kept for one compatibility commit while the SDK migrates in the following commit.
-class AskRequest(BaseModel):
-    pack_id: str
-    question: str
-    stream: bool = False
-    max_tokens: int = 256
-    temperature: float = 0.0
-    top_p: float = 1.0
-    stop: list[str] | None = None
-    extra_body: dict[str, Any] = Field(default_factory=dict)
-
-
-class BenchmarkRunRequest(BaseModel):
-    baseline: Literal[
-        "plain_vllm",
-        "vllm_apc",
-        "flume_stable",
-        "flume_warm_affinity",
-    ] = "flume_warm_affinity"
-    context_lengths: list[int] = Field(default_factory=lambda: [4096, 16384])
-    concurrency: int = 1
-    iterations: int = 3
-    questions: list[str] = Field(default_factory=lambda: ["Summarize the key policy."])
-
-
-class BenchmarkRun(BaseModel):
-    run_id: str
-    request: BenchmarkRunRequest
-    created_at: datetime = Field(default_factory=utc_now)
-    results: dict[str, Any] = Field(default_factory=dict)
-    status: Literal["created", "running", "completed", "failed"] = "created"
-    error: str | None = None
