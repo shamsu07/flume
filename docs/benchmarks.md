@@ -3,6 +3,34 @@
 Benchmarks are offline operator tools. The serving API does not run long-lived
 benchmark jobs or persist benchmark rows.
 
+## Apple M5 paired performance gate
+
+`mac-gate` is a local-only comparison gate for clean source worktrees on an
+Apple M5 host. One external harness verifies each declared commit against
+worktree `HEAD`, then runs three seeded, randomized reference/target pairs at
+concurrency 1, 8, and 32:
+
+```bash
+flume-benchmark mac-gate \
+  --reference-source /path/to/reference-worktree \
+  --reference-commit <reference-commit> \
+  --target-source /path/to/target-worktree \
+  --target-commit <target-commit> \
+  --output benchmark-mac-gate.json
+```
+
+Each run uses at least 25 discarded warmups and 1,000 measured streaming
+requests. Aggregation records p50/p95/p99 TTFT and E2E, throughput, errors,
+routes, observed local counters, deterministic paired bootstrap intervals, and
+SHA-256 checksums for every raw JSON artifact. A cell passes when at least two
+of three paired repetitions meet the configured throughput and latency ratios,
+and every paired run has zero errors. All three concurrency cells must pass.
+
+Output records `gpu_validated=false`, redacts host identity, and makes no
+measurement claim until the command is actually run. Raw artifacts are written
+beside the aggregate in `<output-stem>-raw/`; measurement files should not be
+committed.
+
 ## Process-isolated local workloads
 
 The default local command starts one Flume process and exactly two mock-worker

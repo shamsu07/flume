@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import random
 import re
 import socket
 import subprocess
@@ -63,26 +65,31 @@ class WorkloadFixture:
     pack_indexes: tuple[int, ...]
 
 
-def build_workload_fixture(kind: WorkloadKind, samples: int) -> WorkloadFixture:
+def build_workload_fixture(
+    kind: WorkloadKind,
+    samples: int,
+    *,
+    seed: int | None = None,
+) -> WorkloadFixture:
     if samples < 1:
         raise ValueError("samples must be positive")
     if kind == WorkloadKind.uniform:
         pack_count = min(10, samples)
-        return WorkloadFixture(
-            kind=kind,
-            pack_indexes=tuple(index % pack_count for index in range(samples)),
-        )
+        pack_indexes = [index % pack_count for index in range(samples)]
+        if seed is not None:
+            random.Random(seed).shuffle(pack_indexes)
+        return WorkloadFixture(kind=kind, pack_indexes=tuple(pack_indexes))
     if kind == WorkloadKind.hot_80_20:
         hot_samples = round(samples * 0.8)
-        return WorkloadFixture(
-            kind=kind,
-            pack_indexes=tuple(0 if index < hot_samples else 1 for index in range(samples)),
-        )
+        pack_indexes = [0 if index < hot_samples else 1 for index in range(samples)]
+        if seed is not None:
+            random.Random(seed).shuffle(pack_indexes)
+        return WorkloadFixture(kind=kind, pack_indexes=tuple(pack_indexes))
     if kind == WorkloadKind.shuffled_equivalent:
-        return WorkloadFixture(
-            kind=kind,
-            pack_indexes=tuple(index % 2 for index in range(samples)),
-        )
+        pack_indexes = [index % 2 for index in range(samples)]
+        if seed is not None:
+            random.Random(seed).shuffle(pack_indexes)
+        return WorkloadFixture(kind=kind, pack_indexes=tuple(pack_indexes))
     return WorkloadFixture(kind=kind, pack_indexes=(0,))
 
 
@@ -92,12 +99,32 @@ def reserve_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def start_server(*arguments: str) -> subprocess.Popen[bytes]:
+def start_server(
+    *arguments: str,
+    source_tree: Path | None = None,
+) -> subprocess.Popen[bytes]:
+    command = [sys.executable, "-m", "flume.benchmark_server", *arguments]
+    environment = None
+    if source_tree is not None:
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("benchmark_server.py")),
+            *arguments,
+        ]
+        environment = os.environ.copy()
+        source_path = str(source_tree / "src")
+        existing_pythonpath = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            f"{source_path}{os.pathsep}{existing_pythonpath}"
+            if existing_pythonpath
+            else source_path
+        )
     return subprocess.Popen(
-        [sys.executable, "-m", "flume.benchmark_server", *arguments],
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        env=environment,
     )
 
 
@@ -205,12 +232,16 @@ async def start_ready_process(
     readiness: ReadinessKind,
     timeout: float,
     attempts: int = 3,
+    source_tree: Path | None = None,
 ) -> tuple[subprocess.Popen[bytes], str]:
     if attempts < 1:
         raise ValueError("attempts must be positive")
     for attempt in range(attempts):
         port = reserve_port()
-        process = start_server(*arguments_for_port(port))
+        process = start_server(
+            *arguments_for_port(port),
+            source_tree=source_tree,
+        )
         base_url = f"http://127.0.0.1:{port}"
         try:
             await wait_for_server(
@@ -630,8 +661,16 @@ async def find_pack_for_worker(
 
 
 async def run_local_benchmark(args: Any) -> dict[str, Any]:
+    source_tree_value = getattr(args, "source_tree", None)
+    source_tree = (
+        Path(source_tree_value).expanduser().resolve()
+        if source_tree_value is not None
+        else None
+    )
+    seed = int(getattr(args, "seed", 20260729))
     worker_urls: list[str] = []
     processes: list[subprocess.Popen[bytes]] = []
+    service_counters: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="flume-benchmark-") as temp_dir:
         database_url = f"sqlite:///{Path(temp_dir) / 'flume.db'}"
         try:
@@ -647,6 +686,7 @@ async def run_local_benchmark(args: Any) -> dict[str, Any]:
                         readiness_path="/health",
                         readiness=ReadinessKind.worker,
                         timeout=args.startup_timeout,
+                        source_tree=source_tree,
                     )
                     processes.append(process)
                     worker_urls.append(worker_url)
@@ -660,6 +700,7 @@ async def run_local_benchmark(args: Any) -> dict[str, Any]:
                     readiness_path="/readyz",
                     readiness=ReadinessKind.flume,
                     timeout=args.startup_timeout,
+                    source_tree=source_tree,
                 )
                 processes.append(flume_process)
                 stats_response = await client.get(
@@ -701,7 +742,11 @@ async def run_local_benchmark(args: Any) -> dict[str, Any]:
                 ):
                     if kind not in workload_names:
                         continue
-                    fixture = build_workload_fixture(kind, args.samples)
+                    fixture = build_workload_fixture(
+                        kind,
+                        args.samples,
+                        seed=seed,
+                    )
                     packs = await register_fixture_packs(client, flume_url, fixture)
                     unique_pack_indexes: list[int] = []
                     seen_pack_ids: set[str] = set()
@@ -731,7 +776,11 @@ async def run_local_benchmark(args: Any) -> dict[str, Any]:
                     ) = await warm_packs(client, flume_url, packs)
                     after_setup = await synthetic_metrics_snapshot(client, worker_urls)
                     if args.warmups:
-                        raw_warmup_fixture = build_workload_fixture(kind, args.warmups)
+                        raw_warmup_fixture = build_workload_fixture(
+                            kind,
+                            args.warmups,
+                            seed=seed + 1,
+                        )
                         warmup_fixture = WorkloadFixture(
                             kind=kind,
                             pack_indexes=tuple(
@@ -962,12 +1011,27 @@ async def run_local_benchmark(args: Any) -> dict[str, Any]:
                     phase_samples["measured"].append(unavailable)
                     phase_durations["measured"] += unavailable.e2e_ms / 1000
                     raw_sample_counts["measured"] += 1
+                final_stats_response = await client.get(
+                    f"{flume_url}/v1/stats",
+                    headers={"X-Flume-Tenant": TENANT_ID},
+                )
+                final_stats_response.raise_for_status()
+                final_stats = final_stats_response.json()
+                service_counters = {
+                    "database_pack_rows": int(final_stats["packs"]),
+                    "router_route_rows": int(final_stats["routes"]),
+                    "workers": final_stats["workers"],
+                }
         finally:
             stop_servers(processes)
     from flume.benchmark_cli import build_provenance, environment_metadata
 
     environment = environment_metadata()
-    local_commit = str(environment.get("working_directory_commit", "unknown"))
+    explicit_tested_commit = getattr(args, "tested_commit", None)
+    local_commit = str(
+        explicit_tested_commit
+        or environment.get("working_directory_commit", "unknown")
+    )
     commit_known = re.fullmatch(r"[0-9a-fA-F]{7,64}", local_commit) is not None
     release_valid = commit_known and not bool(environment.get("dirty", False))
     validation_issues = validate_local_results(results, workload_names)
@@ -994,9 +1058,12 @@ async def run_local_benchmark(args: Any) -> dict[str, Any]:
                 },
                 tested_commit=local_commit if commit_known else None,
                 tested_commit_source=(
-                    "local_repo_head" if commit_known else "unknown"
+                    "external_target"
+                    if explicit_tested_commit and commit_known
+                    else ("local_repo_head" if commit_known else "unknown")
                 ),
-                release_valid=release_valid,
+                release_valid=bool(explicit_tested_commit and commit_known)
+                or release_valid,
             ),
             "topology": {
                 "flume_processes": 1,
@@ -1012,7 +1079,9 @@ async def run_local_benchmark(args: Any) -> dict[str, Any]:
             "samples": args.samples,
             "concurrency": args.concurrency,
             "workloads": args.workload,
+            "seed": seed,
         },
+        "service_counters": service_counters,
         "results": results,
         "phase_snapshots": {
             phase: phase_snapshot(

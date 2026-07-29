@@ -1101,6 +1101,9 @@ def build_command_parser() -> argparse.ArgumentParser:
     local.add_argument("--samples", type=int, default=100)
     local.add_argument("--warmups", type=int, default=10)
     local.add_argument("--concurrency", type=int, default=8)
+    local.add_argument("--seed", type=int, default=20260729)
+    local.add_argument("--source-tree", type=Path)
+    local.add_argument("--tested-commit")
     local.add_argument(
         "--workload",
         action="append",
@@ -1120,18 +1123,46 @@ def build_command_parser() -> argparse.ArgumentParser:
     local.add_argument("--output", type=Path, default=Path("benchmark-local.json"))
     gpu = subparsers.add_parser("gpu", help="Run the external vLLM GPU benchmark.")
     add_gpu_arguments(gpu)
+    mac_gate = subparsers.add_parser(
+        "mac-gate",
+        help="Run the paired local-only Apple M5 performance gate.",
+    )
+    mac_gate.add_argument("--reference-source", type=Path, required=True)
+    mac_gate.add_argument("--reference-commit", required=True)
+    mac_gate.add_argument("--target-source", type=Path, required=True)
+    mac_gate.add_argument("--target-commit", required=True)
+    mac_gate.add_argument("--seed", action="append", type=int, default=[])
+    mac_gate.add_argument("--concurrency", action="append", type=int, default=[])
+    mac_gate.add_argument("--warmups", type=int, default=25)
+    mac_gate.add_argument("--samples", type=int, default=1_000)
+    mac_gate.add_argument("--timeout", type=float, default=10.0)
+    mac_gate.add_argument("--startup-timeout", type=float, default=10.0)
+    mac_gate.add_argument("--min-throughput-ratio", type=float, default=0.90)
+    mac_gate.add_argument("--max-ttft-p99-ratio", type=float, default=1.10)
+    mac_gate.add_argument("--max-e2e-p99-ratio", type=float, default=1.10)
+    mac_gate.add_argument("--output", type=Path, default=Path("benchmark-mac-gate.json"))
     return parser
 
 
 def parse_command_args(arguments: list[str] | None = None) -> argparse.Namespace:
     arguments = list(sys.argv[1:] if arguments is None else arguments)
-    if arguments and arguments[0] in {"local", "gpu"}:
+    if arguments and arguments[0] in {"local", "gpu", "mac-gate"}:
         parser = build_command_parser()
         args = parser.parse_args(arguments)
         if args.command == "gpu":
             gpu_args = parse_args(arguments[1:])
             gpu_args.command = "gpu"
             return gpu_args
+        if args.command == "mac-gate":
+            args.seed = args.seed or [20260729, 20260730, 20260731]
+            args.concurrency = args.concurrency or [1, 8, 32]
+            if args.warmups < 25 or args.samples < 1_000:
+                parser.error("mac-gate requires at least 25 warmups and 1000 samples")
+            if args.concurrency != [1, 8, 32]:
+                parser.error("mac-gate concurrency must be exactly 1, 8, and 32")
+            if len(args.seed) != 3 or len(set(args.seed)) != 3:
+                parser.error("mac-gate requires exactly three unique seeds")
+            return args
         args.workload = args.workload or [
             "uniform",
             "hot_80_20",
@@ -1146,6 +1177,10 @@ def parse_command_args(arguments: list[str] | None = None) -> argparse.Namespace
             )
         if args.worker_delay_ms <= 0:
             parser.error("--worker-delay-ms must be positive")
+        if args.tested_commit is not None:
+            if re.fullmatch(r"[0-9a-fA-F]{7,64}", args.tested_commit) is None:
+                parser.error("--tested-commit must contain 7-64 hexadecimal characters")
+            args.tested_commit = args.tested_commit.lower()
         return args
     warning = (
         "flat flume-benchmark invocation is deprecated; use `flume-benchmark gpu ...`"
@@ -1191,6 +1226,12 @@ def main(arguments: list[str] | None = None) -> None:
 
         result = asyncio.run(run_local_benchmark(args))
         report = local_markdown_report(result)
+    elif args.command == "mac-gate":
+        from flume.benchmark_mac_gate import markdown_report as mac_gate_report
+        from flume.benchmark_mac_gate import run_mac_gate
+
+        result = asyncio.run(run_mac_gate(args))
+        report = mac_gate_report(result)
     else:
         result = asyncio.run(run_benchmark(args))
         report = markdown_report(result)
