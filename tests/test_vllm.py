@@ -14,6 +14,63 @@ class FragmentedStream(httpx.AsyncByteStream):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [(200, True), (204, True), (302, False), (401, False), (503, False)],
+)
+async def test_health_requires_a_2xx_response(status_code: int, expected: bool) -> None:
+    client = VLLMClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(status_code)),
+    )
+    await client.start()
+
+    assert await client.health("http://worker") is expected
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_load_parses_and_sums_vllm_running_and_waiting_metrics() -> None:
+    metrics = """
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="a"} 2
+vllm:num_requests_running{model_name="b"} 1
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{model_name="a"} 4
+vllm:num_requests_waiting{model_name="b"} 2
+"""
+    client = VLLMClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, text=metrics)),
+    )
+    await client.start()
+
+    load = await client.load("http://worker")
+
+    assert load is not None
+    assert load.running == 3
+    assert load.waiting == 6
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        "vllm:num_requests_running 1\n",
+        "vllm:num_requests_running -1\nvllm:num_requests_waiting 0\n",
+        "not prometheus",
+    ],
+)
+async def test_load_rejects_missing_or_invalid_metrics(metrics: str) -> None:
+    client = VLLMClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, text=metrics)),
+    )
+    await client.start()
+
+    assert await client.load("http://worker") is None
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_completion_sends_integer_tokens_and_rejects_reserved_fields() -> None:
     payloads = []
 

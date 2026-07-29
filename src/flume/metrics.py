@@ -34,6 +34,27 @@ ROUTER_AFFINITY = Counter(
     "Rendezvous-router affinity decisions",
     ["result"],
 )
+ROUTER_DECISIONS = Counter(
+    "flume_router_decisions_total",
+    "Worker routing decisions by policy and decision class",
+    ["policy", "decision"],
+)
+ROUTER_DECISION_LATENCY = Histogram(
+    "flume_router_decision_duration_seconds",
+    "Cached worker routing decision latency",
+    ["policy"],
+    buckets=(0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005),
+)
+ROUTER_WORKER_LOAD = Gauge(
+    "flume_router_worker_load",
+    "Cached worker load by safe worker ID and fixed load source",
+    ["worker_id", "source"],
+)
+ROUTER_WORKER_LOAD_FRESH = Gauge(
+    "flume_router_worker_load_fresh",
+    "Whether cached upstream worker load is within the configured stale window",
+    ["worker_id"],
+)
 ROUTER_FAILOVERS = Counter(
     "flume_router_failovers_total",
     "Requests rerouted before an upstream response",

@@ -364,6 +364,12 @@ class WorkerStats(BaseModel):
     assigned_packs: int = 0
     affinity_hits: int = 0
     affinity_misses: int = 0
+    local_in_flight: int = 0
+    upstream_running: float | None = None
+    upstream_waiting: float | None = None
+    effective_load: float = 0.0
+    load_fresh: bool = False
+    capacity_weight: float = 1.0
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
