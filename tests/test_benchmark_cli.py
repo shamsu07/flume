@@ -12,12 +12,15 @@ from flume.benchmark_cli import (
     Sample,
     SamplePlan,
     Scenario,
+    build_provenance,
     build_sample_plans,
     choose_worker,
     environment_metadata,
+    exact_flume_context,
     exact_prefix_tokens,
     execute_plans,
     execute_sample,
+    isolated_cold_tenant,
     latency_summary,
     line_has_token,
     markdown_report,
@@ -30,12 +33,18 @@ from flume.benchmark_cli import (
     run_benchmark,
     summarize_samples,
 )
-from flume.benchmark_local import WorkloadKind, build_workload_fixture, pack_chunks
+from flume.benchmark_local import (
+    LocalSample,
+    WorkloadKind,
+    build_workload_fixture,
+    pack_chunks,
+    phase_snapshot,
+)
 
 
 class FakeTokenizer:
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
-        assert add_special_tokens is False
+        del add_special_tokens
         return [ord(character) for character in text]
 
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
@@ -47,6 +56,9 @@ def test_exact_prefix_has_requested_token_length() -> None:
     tokens = exact_prefix_tokens(FakeTokenizer(), 4096)
 
     assert len(tokens) == 4096
+    context = exact_flume_context(FakeTokenizer(), 256, "document")
+    rendered = f'<chunk doc_id="document" chunk_id="0" version="1">\n{context}\n</chunk>'
+    assert len(FakeTokenizer().encode(rendered, add_special_tokens=True)) == 256
 
 
 def test_unstable_scenario_changes_prefix_but_not_length() -> None:
@@ -185,6 +197,32 @@ def test_worker_selection_and_salt_policies() -> None:
     )
     assert cold[0].cache_salt != cold[1].cache_salt
     assert warm[0].cache_salt == warm[1].cache_salt
+    isolated = build_sample_plans(
+        tokenizer=FakeTokenizer(),
+        scenario=Scenario.stable_prefix_random_workers,
+        workers=workers,
+        context_length=8,
+        phase="cold",
+        samples=2,
+        max_output_tokens=2,
+        run_salt="run",
+        seed=1,
+        isolation_identity="concurrency-8",
+    )
+    assert isolated[0].cache_salt != cold[0].cache_salt
+    tenants = {
+        isolated_cold_tenant(
+            "tenant",
+            run_salt="run",
+            scenario=Scenario.stable_warmed_prefix_affinity,
+            context_length=4096,
+            concurrency=8,
+            sample_index=index,
+        )
+        for index in range(10)
+    }
+    assert len(tenants) == 10
+    assert max(map(len, tenants)) <= 128
 
 
 @pytest.mark.parametrize(
@@ -223,6 +261,21 @@ async def test_sample_errors_and_concurrent_execution() -> None:
     assert samples[0].ttft_ms is not None
     assert samples[1].status_code is None
     assert samples[1].error is not None
+
+
+@pytest.mark.asyncio
+async def test_successful_http_with_incomplete_sse_is_an_error() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"text":"x"}]}\n\n',
+        )
+
+    plan = SamplePlan(0, "measured", "http://worker", [1], 1, "salt")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sample = await execute_sample(client, plan, model="model")
+
+    assert sample.error == "InvalidSSE: missing usage, done"
 
 
 @pytest.mark.asyncio
@@ -268,6 +321,7 @@ async def test_flume_sample_uses_public_completion_contract() -> None:
             "max_tokens": 1,
             "temperature": 0.0,
             "stream": True,
+            "extra_body": {"stream_options": {"include_usage": True}},
         },
     }
     assert sample.worker_url == "worker-public-id"
@@ -330,6 +384,8 @@ def benchmark_args() -> Namespace:
         collect_metrics=True,
         flume_url="http://flume",
         tenant="benchmark",
+        gpu_validated=False,
+        tested_commit="1234567abcdef",
     )
 
 
@@ -375,7 +431,7 @@ async def test_full_benchmark_orchestration_and_report(monkeypatch) -> None:
         "register_flume_pack",
         lambda *args, **kwargs: benchmark.asyncio.sleep(
             0,
-            result={"pack_id": "pack-1", "token_count": 9},
+            result={"pack_id": "pack-1", "token_count": 8},
         ),
     )
     monkeypatch.setattr(
@@ -418,12 +474,72 @@ async def test_full_benchmark_orchestration_and_report(monkeypatch) -> None:
     result = await run_benchmark(benchmark_args())
     report = markdown_report(result)
 
-    assert result["status"] == "completed"
+    assert result["status"] == "partial"
     assert result["skipped"][Scenario.apc_disabled] == "no matching worker pool configured"
     assert "stable_warmed_prefix_affinity" in result["results"]
-    assert "Commit: `abc`" in report
+    assert "Tested package commit: `1234567abcdef`" in report
+    assert "Harness working-directory commit: `abc`" in report
     assert "Skipped scenarios" in report
-    assert "| warm |" in report
+    assert "| measured |" in report
+    cell = result["results"][Scenario.stable_warmed_prefix_affinity][
+        "context_8/concurrency_2"
+    ]
+    assert cell["raw_sample_counts"] == {
+        "cold": 1,
+        "setup": 1,
+        "warmup": 1,
+        "measured": 2,
+    }
+    assert set(cell["phase_snapshots"]) == {"cold", "setup", "warmup", "measured"}
+    assert result["provenance"]["gpu_validated"] is False
+    assert result["provenance"]["gpu_validation_basis"] == "not_attested"
+    assert result["provenance"]["package_under_test"] == {
+        "commit": "1234567abcdef",
+        "source": "operator_supplied",
+        "release_valid": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_gpu_sample_errors_mark_run_failed(monkeypatch) -> None:
+    args = benchmark_args()
+    args.scenario = [Scenario.stable_prefix_random_workers.value]
+    monkeypatch.setattr(benchmark, "load_tokenizer", lambda *args: FakeTokenizer())
+    monkeypatch.setattr(benchmark, "environment_metadata", lambda: {"commit": "abc"})
+
+    async def fake_execute(
+        client: object,
+        plans: list[SamplePlan],
+        *,
+        model: str,
+        concurrency: int,
+    ) -> tuple[list[Sample], float]:
+        del client, model, concurrency
+        return (
+            [
+                Sample(
+                    plan.index,
+                    plan.phase,
+                    plan.worker_url,
+                    plan.max_tokens,
+                    len(plan.prompt_token_ids),
+                    None,
+                    None,
+                    2.0,
+                    200,
+                    "InvalidSSE: missing usage, done",
+                )
+                for plan in plans
+            ],
+            0.5,
+        )
+
+    monkeypatch.setattr(benchmark, "execute_plans", fake_execute)
+
+    result = await run_benchmark(args)
+
+    assert result["status"] == "failed"
+    assert result["error_summary"]["total_sample_errors"] == 4
 
 
 def test_environment_metadata_and_tokenizer_loader(monkeypatch) -> None:
@@ -436,7 +552,19 @@ def test_environment_metadata_and_tokenizer_loader(monkeypatch) -> None:
         lambda *args, **kwargs: SimpleNamespace(stdout="deadbeef\n"),
     )
 
-    assert environment_metadata()["commit"] == "deadbeef"
+    assert environment_metadata()["working_directory_commit"] == "deadbeef"
+    provenance = build_provenance(
+        {"commit": "deadbeef", "dirty": False},
+        benchmark_mode="local",
+        gpu_validated=False,
+    )
+    assert provenance["working_directory_git"] == {
+        "commit": "deadbeef",
+        "dirty": False,
+    }
+    assert provenance["package_under_test"]["commit"] == "unknown"
+    assert provenance["gpu_validated"] is False
+    assert provenance["hardware_verification_by_harness"] is False
 
     seen: dict[str, object] = {}
 
@@ -464,6 +592,8 @@ def test_parser_defaults_and_validation() -> None:
             "revision",
             "--vllm-revision",
             "v0.22.0",
+            "--tested-commit",
+            "ABCDEF012345",
             "--apc-worker",
             "http://worker",
             "--flume-url",
@@ -473,6 +603,7 @@ def test_parser_defaults_and_validation() -> None:
     assert args.context_length == [4096, 16384, 65536]
     assert args.concurrency == [1, 8, 32]
     assert len(args.scenario) == 4
+    assert args.tested_commit == "abcdef012345"
 
     base = [
         "--model",
@@ -483,6 +614,8 @@ def test_parser_defaults_and_validation() -> None:
         "revision",
         "--vllm-revision",
         "v0.22.0",
+        "--tested-commit",
+        "abcdef0",
     ]
     with pytest.raises(SystemExit):
         parse_args(base)
@@ -490,6 +623,16 @@ def test_parser_defaults_and_validation() -> None:
         parse_args([*base, "--apc-worker", "worker", "--warm-samples", "0"])
     with pytest.raises(SystemExit):
         parse_args([*base, "--apc-worker", "worker", "--max-output-tokens", "9"])
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                *base,
+                "--tested-commit",
+                "not-a-commit",
+                "--apc-worker",
+                "worker",
+            ]
+        )
 
 
 def test_subcommands_and_legacy_gpu_invocation(capsys) -> None:
@@ -506,6 +649,8 @@ def test_subcommands_and_legacy_gpu_invocation(capsys) -> None:
         "revision",
         "--vllm-revision",
         "v0.22.0",
+        "--tested-commit",
+        "abcdef0",
         "--apc-worker",
         "worker",
         "--flume-url",
@@ -532,11 +677,36 @@ def test_deterministic_local_workload_fixtures() -> None:
         build_workload_fixture(WorkloadKind.uniform, 0)
 
 
+def test_local_phase_snapshot_labels_synthetic_metrics() -> None:
+    sample = LocalSample(0, "measured", 200, "worker", 10, 1, 1.0, 2.5, None)
+    before = {
+        "worker": {"flume_benchmark_synthetic_prefix_cache_queries": 2.0}
+    }
+    after = {
+        "worker": {"flume_benchmark_synthetic_prefix_cache_queries": 3.0}
+    }
+
+    snapshot = phase_snapshot(
+        [sample],
+        metrics_before=before,
+        metrics_after=after,
+    )
+
+    assert snapshot["raw_sample_count"] == 1
+    assert snapshot["synthetic_worker_metrics"]["delta"]["worker"] == {
+        "flume_benchmark_synthetic_prefix_cache_queries": 1.0
+    }
+
+
 def test_main_writes_json_and_markdown(monkeypatch, tmp_path: Path, capsys) -> None:
     output = tmp_path / "nested" / "results.json"
     args = SimpleNamespace(output=output, command="gpu")
     result = {
         "environment": {"commit": "abc"},
+        "provenance": {
+            "package_under_test": {"commit": "abcdef0"},
+            "working_directory_git": {"commit": "abc"},
+        },
         "configuration": {
             "model": "model",
             "tokenizer": "tokenizer",
@@ -560,3 +730,76 @@ def test_main_writes_json_and_markdown(monkeypatch, tmp_path: Path, capsys) -> N
     assert json.loads(output.read_text())["environment"]["commit"] == "abc"
     assert output.with_suffix(".md").read_text().startswith("# Flume GPU benchmark")
     assert "wrote" in capsys.readouterr().out
+
+
+def test_main_writes_partial_result_before_nonzero_exit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "partial.json"
+    args = SimpleNamespace(output=output, command="gpu")
+    result = {
+        "status": "partial",
+        "environment": {"commit": "abc"},
+        "provenance": {
+            "package_under_test": {"commit": "abcdef0"},
+            "working_directory_git": {"commit": "abc"},
+        },
+        "configuration": {
+            "model": "model",
+            "tokenizer": "tokenizer",
+            "tokenizer_revision": "revision",
+            "vllm_revision": "v0.22.0",
+            "apc_workers": [],
+            "apc_disabled_workers": [],
+        },
+        "results": {},
+        "skipped": {"apc_disabled": "not configured"},
+    }
+
+    async def fake_run(_: object) -> dict[str, object]:
+        return result
+
+    monkeypatch.setattr(benchmark, "parse_command_args", lambda _: args)
+    monkeypatch.setattr(benchmark, "run_benchmark", fake_run)
+
+    with pytest.raises(SystemExit) as exit_info:
+        benchmark.main([])
+
+    assert exit_info.value.code == 2
+    assert json.loads(output.read_text())["status"] == "partial"
+
+
+def test_main_uses_failure_exit_code(monkeypatch, tmp_path: Path) -> None:
+    output = tmp_path / "failed.json"
+    args = SimpleNamespace(output=output, command="gpu")
+    result = {
+        "status": "failed",
+        "environment": {"commit": "abc"},
+        "provenance": {
+            "package_under_test": {"commit": "abcdef0"},
+            "working_directory_git": {"commit": "abc"},
+        },
+        "configuration": {
+            "model": "model",
+            "tokenizer": "tokenizer",
+            "tokenizer_revision": "revision",
+            "vllm_revision": "v0.22.0",
+            "apc_workers": [],
+            "apc_disabled_workers": [],
+        },
+        "results": {},
+        "skipped": {},
+    }
+
+    async def fake_run(_: object) -> dict[str, object]:
+        return result
+
+    monkeypatch.setattr(benchmark, "parse_command_args", lambda _: args)
+    monkeypatch.setattr(benchmark, "run_benchmark", fake_run)
+
+    with pytest.raises(SystemExit) as exit_info:
+        benchmark.main([])
+
+    assert exit_info.value.code == 1
+    assert output.exists()

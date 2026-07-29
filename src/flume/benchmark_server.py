@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from typing import Any
+import json
+from collections.abc import AsyncIterator
+from typing import Any, cast
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 
 def create_mock_worker(worker_id: str, delay_ms: float = 0.0) -> FastAPI:
@@ -18,11 +21,13 @@ def create_mock_worker(worker_id: str, delay_ms: float = 0.0) -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/metrics")
-    async def metrics() -> str:
-        return (
-            f"vllm:prefix_cache_queries {state['completions']}\n"
-            f"vllm:prefix_cache_hits {max(0, state['completions'] - 1)}\n"
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> PlainTextResponse:
+        return PlainTextResponse(
+            "flume_benchmark_synthetic_prefix_cache_queries "
+            f"{state['completions']}\n"
+            "flume_benchmark_synthetic_prefix_cache_hits "
+            f"{max(0, state['completions'] - 1)}\n"
         )
 
     @app.post("/benchmark/control")
@@ -34,31 +39,41 @@ def create_mock_worker(worker_id: str, delay_ms: float = 0.0) -> FastAPI:
         return {"delay_ms": requested_delay}
 
     @app.post("/v1/completions")
-    async def completions(payload: dict[str, Any]) -> dict[str, Any]:
+    async def completions(payload: dict[str, Any]) -> Any:
         state["completions"] += 1
-        if state["delay_ms"]:
-            await asyncio.sleep(float(state["delay_ms"]) / 1000)
         prompt = payload.get("prompt", [])
         prompt_tokens = len(prompt) if isinstance(prompt, list) else len(str(prompt))
         completion_tokens = int(payload.get("max_tokens", 1))
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        choice = {
+            "text": "x" * completion_tokens,
+            "index": 0,
+            "logprobs": None,
+            "finish_reason": "length",
+        }
+        if payload.get("stream"):
+
+            async def events() -> AsyncIterator[bytes]:
+                if state["delay_ms"]:
+                    await asyncio.sleep(float(state["delay_ms"]) / 1000)
+                yield f"data: {json.dumps({'choices': [choice]})}\n\n".encode()
+                yield f"data: {json.dumps({'choices': [], 'usage': usage})}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(events(), media_type="text/event-stream")
+        if state["delay_ms"]:
+            await asyncio.sleep(float(state["delay_ms"]) / 1000)
         return {
             "id": f"mock-{worker_id}-{state['completions']}",
             "object": "text_completion",
             "created": 0,
             "model": payload.get("model", "local-benchmark"),
-            "choices": [
-                {
-                    "text": "x" * completion_tokens,
-                    "index": 0,
-                    "logprobs": None,
-                    "finish_reason": "length",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "choices": [choice],
+            "usage": usage,
         }
 
     return app
@@ -76,7 +91,11 @@ def run_worker(args: argparse.Namespace) -> None:
 
 def run_flume(args: argparse.Namespace) -> None:
     from flume.api import create_app
-    from flume.compiler import ContextPackCompiler, DeterministicByteTokenizer
+    from flume.compiler import (
+        ContextPackCompiler,
+        DeterministicByteTokenizer,
+        Tokenizer,
+    )
     from flume.config import Settings
 
     tokenizer = DeterministicByteTokenizer()
@@ -95,7 +114,10 @@ def run_flume(args: argparse.Namespace) -> None:
         cache_salt_secret="local-benchmark-secret-not-for-production",
         metrics_enabled=True,
     )
-    compiler = ContextPackCompiler(tokenizer, model_id=settings.model_id)
+    compiler = ContextPackCompiler(
+        cast(Tokenizer, tokenizer),
+        model_id=settings.model_id,
+    )
     uvicorn.run(
         create_app(settings, compiler=compiler),
         host="127.0.0.1",
