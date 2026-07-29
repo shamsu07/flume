@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from flume.router import NoHealthyWorkers, PackRouter, WarmupSingleFlight
+from flume.router import NoHealthyWorkers, PackRouter, WarmupSingleFlight, WorkerLoad
 
 
 @pytest.mark.asyncio
@@ -106,6 +106,26 @@ async def test_bounded_hrw_spills_to_one_secondary_and_holds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bounded_hrw_skips_overloaded_second_rank_for_global_load_bound() -> None:
+    workers = ["http://a", "http://b", "http://c"]
+    ranked = sorted(
+        workers,
+        key=lambda worker: PackRouter._score("pack", worker),
+        reverse=True,
+    )
+    router = PackRouter(
+        workers,
+        routing_policy="bounded_hrw",
+        load_slack=2,
+    )
+    for _ in range(3):
+        router.acquire(ranked[0])
+        router.acquire(ranked[1])
+
+    assert await router.choose("pack") == ranked[2]
+
+
+@pytest.mark.asyncio
 async def test_bounded_hrw_uses_capacity_normalized_load() -> None:
     workers = ["http://a", "http://b"]
     primary = await PackRouter(workers).choose("pack")
@@ -123,6 +143,67 @@ async def test_bounded_hrw_uses_capacity_normalized_load() -> None:
 
     router.acquire(secondary)
     assert await router.choose("another-pack") in workers
+
+
+@pytest.mark.asyncio
+async def test_bounded_hrw_uses_fresh_upstream_load_then_falls_back_when_stale() -> None:
+    now = 0.0
+    workers = ["http://a", "http://b"]
+    primary = await PackRouter(workers).choose("pack")
+    loads = {
+        worker: WorkerLoad(running=3 if worker == primary else 0, waiting=0)
+        for worker in workers
+    }
+
+    async def load(worker_url: str) -> WorkerLoad:
+        return loads[worker_url]
+
+    router = PackRouter(
+        workers,
+        load_checker=load,
+        routing_policy="bounded_hrw",
+        load_slack=2,
+        spill_hold_seconds=0,
+        load_refresh_seconds=0.5,
+        load_stale_seconds=2.0,
+        clock=lambda: now,
+    )
+    await router.refresh_load()
+    assert await router.choose("pack") != primary
+
+    now = 2.0
+    assert await router.choose("pack") == primary
+
+
+@pytest.mark.asyncio
+async def test_failed_load_refresh_keeps_snapshot_only_until_stale() -> None:
+    now = 0.0
+    workers = ["http://a", "http://b"]
+    primary = await PackRouter(workers).choose("pack")
+    available = True
+
+    async def load(worker_url: str) -> WorkerLoad | None:
+        if not available:
+            return None
+        return WorkerLoad(running=4 if worker_url == primary else 0, waiting=0)
+
+    router = PackRouter(
+        workers,
+        load_checker=load,
+        routing_policy="bounded_hrw",
+        spill_hold_seconds=0,
+        load_refresh_seconds=0.5,
+        load_stale_seconds=2.0,
+        clock=lambda: now,
+    )
+    await router.refresh_load()
+    available = False
+    now = 1.0
+    await router.refresh_load()
+    assert await router.choose("pack") != primary
+
+    now = 2.0
+    assert await router.choose("pack") == primary
 
 
 @pytest.mark.asyncio

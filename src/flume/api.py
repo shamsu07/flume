@@ -15,6 +15,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from starlette.background import BackgroundTask
 
 from flume.compiler import ContextPackCompiler
 from flume.config import INSECURE_CACHE_SALT_SECRET, Settings, get_settings
@@ -77,6 +78,52 @@ class AdmissionController:
             IN_FLIGHT.dec()
 
 
+class ManagedCompletionStream:
+    """Own an upstream stream and finalize request accounting exactly once."""
+
+    def __init__(
+        self,
+        stream: VLLMStream,
+        admission: AdmissionController,
+        worker_url: str,
+    ):
+        self.stream = stream
+        self.admission = admission
+        self.worker_url = worker_url
+        self._iterator = stream.__aiter__()
+        self._closed = False
+
+    def __aiter__(self) -> ManagedCompletionStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await anext(self._iterator)
+        except StopAsyncIteration:
+            await self.aclose(outcome="ok")
+            raise
+        except asyncio.CancelledError:
+            await self.aclose(outcome="cancelled")
+            raise
+        except Exception:
+            await self.aclose(outcome="failed")
+            raise
+
+    async def aclose(self, *, outcome: str = "cancelled") -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.stream.aclose()
+        finally:
+            ASKS_TOTAL.labels(
+                worker_id=_worker_id(self.worker_url),
+                stream="true",
+                outcome=outcome,
+            ).inc()
+            self.admission.release()
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -91,12 +138,16 @@ def create_app(
     vllm = VLLMClient(
         timeout_seconds=settings.request_timeout_seconds,
         connect_timeout_seconds=settings.connect_timeout_seconds,
+        health_timeout_seconds=settings.health_timeout_seconds,
         transport=vllm_transport,
     )
     router = PackRouter(
         settings.vllm_workers,
         health_checker=vllm.health,
+        load_checker=vllm.load if settings.routing_policy == "bounded_hrw" else None,
         refresh_seconds=settings.health_refresh_seconds,
+        load_refresh_seconds=settings.worker_load_refresh_ms / 1_000,
+        load_stale_seconds=settings.worker_load_stale_ms / 1_000,
         routing_policy=settings.routing_policy,
         load_slack=settings.routing_load_slack,
         spill_hold_seconds=settings.routing_spill_hold_ms / 1_000,
@@ -342,10 +393,12 @@ def create_app(
                 metric_worker = _worker_id(actual_worker)
                 headers["X-Flume-Worker-Id"] = metric_worker
                 stream_handed_off = True
+                managed_stream = _stream_with_release(stream, admission, actual_worker)
                 return StreamingResponse(
-                    _stream_with_release(stream, admission, actual_worker),
+                    managed_stream,
                     media_type="text/event-stream",
                     headers=headers,
+                    background=BackgroundTask(managed_stream.aclose),
                 )
 
             started = time.perf_counter()
@@ -587,28 +640,12 @@ def _finish_worker_stream(router: PackRouter, worker_url: str, latency_ms: float
     router.release(worker_url)
 
 
-async def _stream_with_release(
+def _stream_with_release(
     stream: VLLMStream,
     admission: AdmissionController,
     worker_url: str,
-) -> AsyncIterator[bytes]:
-    outcome = "ok"
-    try:
-        async for chunk in stream:
-            yield chunk
-    except asyncio.CancelledError:
-        outcome = "cancelled"
-        raise
-    except Exception:
-        outcome = "failed"
-        raise
-    finally:
-        ASKS_TOTAL.labels(
-            worker_id=_worker_id(worker_url),
-            stream="true",
-            outcome=outcome,
-        ).inc()
-        admission.release()
+) -> ManagedCompletionStream:
+    return ManagedCompletionStream(stream, admission, worker_url)
 
 
 def _worker_id(worker_url: str) -> str:

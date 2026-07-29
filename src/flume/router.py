@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable
@@ -26,6 +27,22 @@ class RoutingState:
     spill_until: float
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerLoad:
+    running: float
+    waiting: float
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerLoadSnapshot:
+    running: float
+    waiting: float
+    observed_at: float
+
+
+LoadChecker = Callable[[str], Awaitable[WorkerLoad | None]]
+
+
 class PackRouter:
     """Health-aware rendezvous hashing with a background-only health hot path."""
 
@@ -33,8 +50,11 @@ class PackRouter:
         self,
         worker_urls: list[str],
         health_checker: HealthChecker | None = None,
+        load_checker: LoadChecker | None = None,
         *,
         refresh_seconds: float = 5.0,
+        load_refresh_seconds: float = 0.5,
+        load_stale_seconds: float = 2.0,
         routing_policy: str = "hrw",
         load_slack: int = 2,
         spill_hold_seconds: float = 2.0,
@@ -51,6 +71,10 @@ class PackRouter:
             raise ValueError("load_slack cannot be negative")
         if spill_hold_seconds < 0:
             raise ValueError("spill_hold_seconds cannot be negative")
+        if load_refresh_seconds <= 0:
+            raise ValueError("load_refresh_seconds must be positive")
+        if load_stale_seconds < load_refresh_seconds:
+            raise ValueError("load_stale_seconds must be at least load_refresh_seconds")
         if state_max_entries < 1:
             raise ValueError("state_max_entries must be positive")
         if state_ttl_seconds <= 0:
@@ -62,7 +86,10 @@ class PackRouter:
         if any(weight <= 0 for weight in weights.values()):
             raise ValueError("capacity_weights must be greater than zero")
         self.health_checker = health_checker
+        self.load_checker = load_checker
         self.refresh_seconds = refresh_seconds
+        self.load_refresh_seconds = load_refresh_seconds
+        self.load_stale_seconds = load_stale_seconds
         self.routing_policy = routing_policy
         self.load_slack = load_slack
         self.spill_hold_seconds = spill_hold_seconds
@@ -74,32 +101,52 @@ class PackRouter:
         self._clock = clock
         initial_health = health_checker is None
         self._health = {worker: initial_health for worker in self.worker_urls}
-        self._monitor_task: asyncio.Task[None] | None = None
+        self._health_monitor_task: asyncio.Task[None] | None = None
+        self._load_monitor_task: asyncio.Task[None] | None = None
+        self._worker_load: dict[str, WorkerLoadSnapshot | None] = {
+            worker: None for worker in self.worker_urls
+        }
         self._assignments: OrderedDict[str, RoutingState] = OrderedDict()
         self._affinity: Counter[str] = Counter()
         self._local_in_flight: Counter[str] = Counter()
 
     async def start(self) -> None:
-        if self.health_checker is None or self._monitor_task is not None:
-            return
-        await self.refresh_health()
-        self._monitor_task = asyncio.create_task(
-            self._monitor(),
-            name="flume-worker-health-monitor",
-        )
+        if self.health_checker is not None and self._health_monitor_task is None:
+            await self.refresh_health()
+            self._health_monitor_task = asyncio.create_task(
+                self._monitor_health(),
+                name="flume-worker-health-monitor",
+            )
+        if self.load_checker is not None and self._load_monitor_task is None:
+            await self.refresh_load()
+            self._load_monitor_task = asyncio.create_task(
+                self._monitor_load(),
+                name="flume-worker-load-monitor",
+            )
 
     async def close(self) -> None:
-        if self._monitor_task is None:
-            return
-        self._monitor_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await self._monitor_task
-        self._monitor_task = None
+        tasks = [
+            task
+            for task in (self._health_monitor_task, self._load_monitor_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._health_monitor_task = None
+        self._load_monitor_task = None
 
-    async def _monitor(self) -> None:
+    async def _monitor_health(self) -> None:
         while True:
             await asyncio.sleep(self.refresh_seconds)
             await self.refresh_health()
+
+    async def _monitor_load(self) -> None:
+        while True:
+            await asyncio.sleep(self.load_refresh_seconds)
+            await self.refresh_load()
 
     async def refresh_health(self) -> dict[str, bool]:
         health_checker = self.health_checker
@@ -115,6 +162,40 @@ class PackRouter:
         results = await asyncio.gather(*(checked(worker) for worker in self.worker_urls))
         self._health = dict(results)
         return dict(self._health)
+
+    async def refresh_load(self) -> dict[str, WorkerLoadSnapshot | None]:
+        load_checker = self.load_checker
+        if load_checker is None:
+            return dict(self._worker_load)
+
+        async def checked(worker: str) -> tuple[str, WorkerLoad | None]:
+            try:
+                load = await load_checker(worker)
+            except Exception:
+                return worker, None
+            if load is None:
+                return worker, None
+            if (
+                not math.isfinite(load.running)
+                or not math.isfinite(load.waiting)
+                or load.running < 0
+                or load.waiting < 0
+            ):
+                return worker, None
+            return worker, load
+
+        results = await asyncio.gather(*(checked(worker) for worker in self.worker_urls))
+        observed_at = self._clock()
+        updated = dict(self._worker_load)
+        for worker, load in results:
+            if load is not None:
+                updated[worker] = WorkerLoadSnapshot(
+                    running=load.running,
+                    waiting=load.waiting,
+                    observed_at=observed_at,
+                )
+        self._worker_load = updated
+        return dict(self._worker_load)
 
     async def choose(self, pack_id: str, *, exclude: set[str] | None = None) -> str:
         excluded = exclude or set()
@@ -132,17 +213,25 @@ class PackRouter:
         previous = self._get_state(pack_id, now)
         worker = primary
         if self.routing_policy == "bounded_hrw" and len(ranked) > 1:
-            secondary = ranked[1]
             if (
                 previous is not None
-                and previous.worker_url == secondary
+                and previous.worker_url != primary
+                and previous.worker_url in candidates
                 and previous.spill_until > now
             ):
-                worker = secondary
-            elif self._effective_load(primary) > (
-                self._effective_load(secondary) + self.load_slack
-            ):
-                worker = secondary
+                worker = previous.worker_url
+            else:
+                effective_loads = {
+                    candidate: self._effective_load(candidate, now) for candidate in candidates
+                }
+                minimum_load = min(effective_loads.values())
+                load_bound = minimum_load + self.load_slack
+                if effective_loads[primary] > load_bound:
+                    worker = next(
+                        candidate
+                        for candidate in ranked[1:]
+                        if effective_loads[candidate] <= load_bound
+                    )
 
         if previous is not None and previous.worker_url == worker:
             self._affinity["hit"] += 1
@@ -180,8 +269,18 @@ class PackRouter:
                 break
             del self._assignments[oldest_pack_id]
 
-    def _effective_load(self, worker_url: str) -> float:
-        return self._local_in_flight[worker_url] / self.capacity_weights[worker_url]
+    def _effective_load(self, worker_url: str, now: float | None = None) -> float:
+        observed_at = self._clock() if now is None else now
+        upstream_load = 0.0
+        snapshot = self._worker_load[worker_url]
+        if (
+            snapshot is not None
+            and observed_at - snapshot.observed_at < self.load_stale_seconds
+        ):
+            upstream_load = snapshot.running + snapshot.waiting
+        return (
+            self._local_in_flight[worker_url] + upstream_load
+        ) / self.capacity_weights[worker_url]
 
     def mark_unhealthy(self, worker_url: str) -> None:
         if worker_url in self._health:

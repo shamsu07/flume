@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
@@ -11,7 +12,9 @@ from fastapi.testclient import TestClient
 from flume.api import AdmissionController, _stream_with_release, create_app
 from flume.compiler import ContextPackCompiler, DeterministicByteTokenizer
 from flume.config import INSECURE_CACHE_SALT_SECRET, Settings
+from flume.router import PackRouter
 from flume.store import PackConflictError
+from flume.vllm import VLLMStream
 
 SECRET = "test-secret-that-is-at-least-thirty-two-bytes"
 
@@ -388,6 +391,58 @@ async def test_streaming_cancellation_releases_admission() -> None:
     with pytest.raises(asyncio.CancelledError):
         await anext(stream)
 
+    assert admission.current == 0
+
+
+@pytest.mark.asyncio
+async def test_never_iterated_stream_releases_accounting_once() -> None:
+    class StubStream:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self
+
+        async def __anext__(self) -> bytes:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    admission = AdmissionController(1)
+    assert admission.acquire()
+    upstream = StubStream()
+    managed = _stream_with_release(
+        cast(Any, upstream),
+        admission,
+        "http://worker",
+    )
+
+    await managed.aclose()
+    await managed.aclose()
+
+    assert upstream.close_calls == 1
+    assert admission.current == 0
+
+
+@pytest.mark.asyncio
+async def test_never_iterated_upstream_stream_releases_worker_lease_once() -> None:
+    router = PackRouter(["http://worker"])
+    router.acquire("http://worker")
+    response = httpx.Response(200, stream=FragmentedStream([b"data: [DONE]\n\n"]))
+    stream = VLLMStream(
+        response,
+        started=time.perf_counter(),
+        on_done=lambda _: router.release("http://worker"),
+    )
+    admission = AdmissionController(1)
+    assert admission.acquire()
+    managed = _stream_with_release(stream, admission, "http://worker")
+
+    await managed.aclose()
+    await managed.aclose()
+
+    assert router.local_in_flight("http://worker") == 0
     assert admission.current == 0
 
 

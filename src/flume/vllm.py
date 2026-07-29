@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from prometheus_client.parser import text_string_to_metric_families
+
+from flume.router import WorkerLoad
 
 Prompt = str | list[int]
 RESERVED_EXTRA_FIELDS = {
@@ -121,10 +125,12 @@ class VLLMClient:
         timeout_seconds: float = 120.0,
         *,
         connect_timeout_seconds: float = 5.0,
+        health_timeout_seconds: float = 2.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self.timeout_seconds = timeout_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
+        self.health_timeout_seconds = health_timeout_seconds
         self.transport = transport
         self._client: httpx.AsyncClient | None = None
 
@@ -153,11 +159,54 @@ class VLLMClient:
         try:
             response = await self.client.get(
                 f"{worker_url.rstrip('/')}/health",
-                timeout=self.connect_timeout_seconds,
+                timeout=self.health_timeout_seconds,
             )
-            return response.status_code < 500
+            return response.is_success
         except httpx.HTTPError:
             return False
+
+    async def load(self, worker_url: str) -> WorkerLoad | None:
+        try:
+            response = await self.client.get(
+                f"{worker_url.rstrip('/')}/metrics",
+                timeout=self.health_timeout_seconds,
+            )
+        except httpx.HTTPError:
+            return None
+        if not response.is_success:
+            return None
+        try:
+            values = self._request_load_values(response.text)
+        except ValueError:
+            return None
+        if values is None:
+            return None
+        running, waiting = values
+        return WorkerLoad(running=running, waiting=waiting)
+
+    @staticmethod
+    def _request_load_values(metrics_text: str) -> tuple[float, float] | None:
+        metric_names = {
+            "vllm:num_requests_running": "running",
+            "vllm_num_requests_running": "running",
+            "vllm:num_requests_waiting": "waiting",
+            "vllm_num_requests_waiting": "waiting",
+        }
+        totals = {"running": 0.0, "waiting": 0.0}
+        found: set[str] = set()
+        for family in text_string_to_metric_families(metrics_text):
+            for sample in family.samples:
+                kind = metric_names.get(sample.name)
+                if kind is None:
+                    continue
+                value = float(sample.value)
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError("invalid vLLM request load")
+                totals[kind] += value
+                found.add(kind)
+        if found != {"running", "waiting"}:
+            return None
+        return totals["running"], totals["waiting"]
 
     async def complete(
         self,
