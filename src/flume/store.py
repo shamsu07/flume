@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from flume.models import BenchmarkRun, ContextPack
+from flume.models import ContextPack
 
 
 class Base(DeclarativeBase):
@@ -60,15 +60,6 @@ class PackAnnotationRecord(Base):
     tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     pack_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    data: Mapped[str] = mapped_column(Text)
-
-
-class BenchmarkRecord(Base):
-    __tablename__ = "benchmark_runs"
-
-    run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    status: Mapped[str] = mapped_column(String(32), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     data: Mapped[str] = mapped_column(Text)
 
 
@@ -225,11 +216,13 @@ class FlumeStore:
             "data": pack.model_dump_json(),
         }
         async with self.session() as session:
-            statement = sqlite_insert(PackRecord).values(**values).on_conflict_do_nothing(
-                index_elements=["tenant_id", "pack_id"]
+            statement = (
+                sqlite_insert(PackRecord)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=["tenant_id", "pack_id"])
             )
             result = await session.execute(statement)
-            if result.rowcount == 1:
+            if getattr(result, "rowcount", None) == 1:
                 return pack
             existing = await session.get(PackRecord, (pack.tenant_id, pack.pack_id))
             if existing is None:
@@ -324,33 +317,6 @@ class FlumeStore:
                 )
             )
         return int(packs or 0), 0
-
-    async def save_benchmark(self, run: BenchmarkRun) -> BenchmarkRun:
-        values = {
-            "run_id": run.run_id,
-            "status": run.status,
-            "created_at": run.created_at,
-            "data": run.model_dump_json(),
-        }
-        async with self.session() as session:
-            statement = sqlite_insert(BenchmarkRecord).values(**values)
-            statement = statement.on_conflict_do_update(
-                index_elements=["run_id"],
-                set_={"status": run.status, "data": run.model_dump_json()},
-            )
-            await session.execute(statement)
-        return run
-
-    async def get_benchmark(self, run_id: str) -> BenchmarkRun | None:
-        async with self.session() as session:
-            record = await session.get(BenchmarkRecord, run_id)
-            return None if record is None else BenchmarkRun.model_validate_json(record.data)
-
-    async def list_benchmarks(self) -> list[BenchmarkRun]:
-        async with self.session() as session:
-            statement = select(BenchmarkRecord).order_by(BenchmarkRecord.created_at.desc())
-            records = (await session.scalars(statement)).all()
-            return [BenchmarkRun.model_validate_json(record.data) for record in records]
 
     @staticmethod
     def _immutable_identity(record: PackRecord) -> tuple[Any, ...]:

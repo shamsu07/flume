@@ -5,7 +5,7 @@ import hashlib
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 from flume.metrics import ROUTER_AFFINITY, ROUTER_UNAVAILABLE
 
@@ -61,12 +61,13 @@ class PackRouter:
             await self.refresh_health()
 
     async def refresh_health(self) -> dict[str, bool]:
-        if self.health_checker is None:
+        health_checker = self.health_checker
+        if health_checker is None:
             return dict(self._health)
 
         async def checked(worker: str) -> tuple[str, bool]:
             try:
-                return worker, bool(await self.health_checker(worker))
+                return worker, bool(await health_checker(worker))
             except Exception:
                 return worker, False
 
@@ -125,12 +126,12 @@ class PackRouter:
         return int.from_bytes(digest, "big")
 
 
-class WarmupSingleFlight:
+class WarmupSingleFlight(Generic[T]):
     """Coalesce concurrent warmups for the same tenant, pack, and worker."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._tasks: dict[tuple[str, str, str], asyncio.Task[T]] = {}
+        self._tasks: dict[tuple[str, str, str], asyncio.Future[T]] = {}
 
     async def run(
         self,
@@ -140,7 +141,7 @@ class WarmupSingleFlight:
         async with self._lock:
             task = self._tasks.get(key)
             if task is None:
-                task = asyncio.create_task(operation())
+                task = asyncio.ensure_future(operation())
                 self._tasks[key] = task
         try:
             return await asyncio.shield(task)

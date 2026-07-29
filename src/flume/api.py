@@ -33,10 +33,11 @@ from flume.metrics import (
     WARMUPS_TOTAL,
 )
 from flume.models import (
-    AskRequest,
+    CompletionRequest,
     ContextPack,
     PackCreateRequest,
     PackPage,
+    PackRegistrationRequest,
     PackSummary,
     StatsResponse,
     WarmRequest,
@@ -98,7 +99,7 @@ def create_app(
         refresh_seconds=settings.health_refresh_seconds,
     )
     cache = ByteBoundedPackCache(settings.pack_cache_bytes)
-    warmups = WarmupSingleFlight()
+    warmups: WarmupSingleFlight[tuple[CompletionResult, str]] = WarmupSingleFlight()
     admission = AdmissionController(settings.max_in_flight)
 
     @asynccontextmanager
@@ -187,16 +188,15 @@ def create_app(
 
     @app.post("/v1/packs", response_model=PackSummary)
     async def create_pack(
-        request: PackCreateRequest,
+        request: PackRegistrationRequest,
         tenant_id: str = TENANT_HEADER,
     ) -> PackSummary:
         runtime_compiler = _require_compiler(app)
-        authoritative = request.model_copy(
-            update={
-                "tenant_id": tenant_id,
-                "model_id": settings.model_id,
-                "tokenizer_id": settings.tokenizer_id,
-            }
+        authoritative = PackCreateRequest(
+            **request.model_dump(),
+            tenant_id=tenant_id,
+            model_id=settings.model_id,
+            tokenizer_id=settings.tokenizer_id,
         )
         try:
             pack = runtime_compiler.compile(authoritative)
@@ -252,7 +252,7 @@ def create_app(
         tenant_id: str = TENANT_HEADER,
     ) -> WarmResponse:
         runtime_compiler = _require_compiler(app)
-        request = request or WarmRequest(pack_id=pack_id)
+        request = request or WarmRequest()
         pack = await _load_pack(store, cache, tenant_id, pack_id)
         worker_url = await _choose_worker(router, pack_id)
         question = request.question if request.strategy == "echo_question" else "warm"
@@ -289,18 +289,16 @@ def create_app(
         WARMUP_LATENCY.observe(latency_ms / 1000)
         return WarmResponse(
             pack_id=pack_id,
-            worker_url=actual_worker,
+            worker_id=_worker_id(actual_worker),
             warmed=True,
             latency_ms=latency_ms,
         )
 
     @app.post("/v1/completions", response_model=None)
     async def completions(
-        request: AskRequest,
+        request: CompletionRequest,
         tenant_id: str = TENANT_HEADER,
     ) -> Response:
-        if not request.question.strip():
-            raise HTTPException(status_code=422, detail="question cannot be empty")
         if request.max_tokens < 1 or request.max_tokens > settings.max_output_tokens:
             raise HTTPException(
                 status_code=422,
@@ -317,11 +315,11 @@ def create_app(
             pack = await _load_pack(store, cache, tenant_id, request.pack_id)
             worker_url = await router.choose(request.pack_id)
             metric_worker = _worker_id(worker_url)
-            prompt = runtime_compiler.completion_token_ids(pack, request.question)
+            prompt = runtime_compiler.completion_token_ids(pack, request.prompt)
             salt = _cache_salt(settings, tenant_id)
             headers = {
                 "X-Flume-Pack-Id": pack.pack_id,
-                "X-Flume-Worker-Url": worker_url,
+                "X-Flume-Worker-Id": metric_worker,
                 "X-Flume-Prompt-Tokens": str(len(prompt)),
             }
             if request.stream:
@@ -335,8 +333,8 @@ def create_app(
                     request=request,
                     cache_salt=salt,
                 )
-                headers["X-Flume-Worker-Url"] = actual_worker
                 metric_worker = _worker_id(actual_worker)
+                headers["X-Flume-Worker-Id"] = metric_worker
                 stream_handed_off = True
                 return StreamingResponse(
                     _stream_with_release(stream, admission, actual_worker),
@@ -362,7 +360,7 @@ def create_app(
             ASK_LATENCY.observe(time.perf_counter() - started)
             metric_worker = _worker_id(actual_worker)
             outcome = "ok"
-            headers["X-Flume-Worker-Url"] = actual_worker
+            headers["X-Flume-Worker-Id"] = metric_worker
             body = {
                 "id": f"cmpl-{uuid.uuid4().hex}",
                 "object": "text_completion",
@@ -415,7 +413,7 @@ def create_app(
             )
             workers.append(
                 WorkerStats(
-                    worker_url=worker,
+                    worker_id=_worker_id(worker),
                     healthy=health.get(worker),
                     assigned_packs=counts["assigned_packs"],
                     affinity_hits=counts["affinity_hits"],
@@ -486,7 +484,7 @@ async def _complete_with_failover(
     max_tokens: int,
     temperature: float,
     top_p: float,
-    stop: list[str] | None,
+    stop: str | list[str] | None,
     extra_body: dict[str, Any] | None,
     cache_salt: str,
 ) -> tuple[CompletionResult, str]:
@@ -529,29 +527,32 @@ async def _open_stream_with_failover(
     pack_id: str,
     model: str,
     prompt: list[int],
-    request: AskRequest,
+    request: CompletionRequest,
     cache_salt: str,
 ) -> tuple[VLLMStream, str]:
-    kwargs = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": request.max_tokens,
-        "temperature": request.temperature,
-        "top_p": request.top_p,
-        "stop": request.stop,
-        "extra_body": request.extra_body,
-        "cache_salt": cache_salt,
-        "on_first_token": lambda value: TTFT.observe(value / 1000),
-        "on_done": lambda value: ASK_LATENCY.observe(value / 1000),
-    }
+    async def open_stream(target_worker: str) -> VLLMStream:
+        return await vllm.open_stream_completion(
+            worker_url=target_worker,
+            model=model,
+            prompt=prompt,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            stop=request.stop,
+            extra_body=request.extra_body,
+            cache_salt=cache_salt,
+            on_first_token=lambda value: TTFT.observe(value / 1000),
+            on_done=lambda value: ASK_LATENCY.observe(value / 1000),
+        )
+
     try:
-        stream = await vllm.open_stream_completion(worker_url=worker_url, **kwargs)
+        stream = await open_stream(worker_url)
         return stream, worker_url
     except VLLMConnectionError:
         ROUTER_FAILOVERS.labels(operation="stream").inc()
         router.mark_unhealthy(worker_url)
         replacement = await router.choose(pack_id, exclude={worker_url})
-        stream = await vllm.open_stream_completion(worker_url=replacement, **kwargs)
+        stream = await open_stream(replacement)
         return stream, replacement
 
 
