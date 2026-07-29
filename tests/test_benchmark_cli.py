@@ -30,6 +30,7 @@ from flume.benchmark_cli import (
     run_benchmark,
     summarize_samples,
 )
+from flume.benchmark_local import WorkloadKind, build_workload_fixture, pack_chunks
 
 
 class FakeTokenizer:
@@ -514,6 +515,21 @@ def test_subcommands_and_legacy_gpu_invocation(capsys) -> None:
     with pytest.warns(DeprecationWarning):
         assert parse_command_args(gpu_arguments).command == "gpu"
     assert "deprecated" in capsys.readouterr().err
+
+
+def test_deterministic_local_workload_fixtures() -> None:
+    uniform = build_workload_fixture(WorkloadKind.uniform, 100)
+    hot = build_workload_fixture(WorkloadKind.hot_80_20, 100)
+    shuffled = build_workload_fixture(WorkloadKind.shuffled_equivalent, 8)
+
+    assert uniform.pack_indexes == tuple(index % 10 for index in range(100))
+    assert hot.pack_indexes.count(0) == 80
+    assert hot.pack_indexes.count(1) == 20
+    assert shuffled.pack_indexes == (0, 1, 0, 1, 0, 1, 0, 1)
+    assert pack_chunks(4) == pack_chunks(4)
+    assert pack_chunks(4) != pack_chunks(5)
+    with pytest.raises(ValueError, match="positive"):
+        build_workload_fixture(WorkloadKind.uniform, 0)
 
 
 def test_main_writes_json_and_markdown(monkeypatch, tmp_path: Path, capsys) -> None:

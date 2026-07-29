@@ -7,12 +7,12 @@ import asyncio
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 
 def create_mock_worker(worker_id: str, delay_ms: float = 0.0) -> FastAPI:
     app = FastAPI(title=f"Flume benchmark worker {worker_id}")
-    counters = {"completions": 0}
+    state: dict[str, float | int] = {"completions": 0, "delay_ms": delay_ms}
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -21,20 +21,28 @@ def create_mock_worker(worker_id: str, delay_ms: float = 0.0) -> FastAPI:
     @app.get("/metrics")
     async def metrics() -> str:
         return (
-            f"vllm:prefix_cache_queries {counters['completions']}\n"
-            f"vllm:prefix_cache_hits {max(0, counters['completions'] - 1)}\n"
+            f"vllm:prefix_cache_queries {state['completions']}\n"
+            f"vllm:prefix_cache_hits {max(0, state['completions'] - 1)}\n"
         )
+
+    @app.post("/benchmark/control")
+    async def control(payload: dict[str, Any]) -> dict[str, float]:
+        requested_delay = float(payload.get("delay_ms", 0.0))
+        if requested_delay < 0 or requested_delay > 10_000:
+            raise HTTPException(status_code=422, detail="delay_ms must be between 0 and 10000")
+        state["delay_ms"] = requested_delay
+        return {"delay_ms": requested_delay}
 
     @app.post("/v1/completions")
     async def completions(payload: dict[str, Any]) -> dict[str, Any]:
-        counters["completions"] += 1
-        if delay_ms:
-            await asyncio.sleep(delay_ms / 1000)
+        state["completions"] += 1
+        if state["delay_ms"]:
+            await asyncio.sleep(float(state["delay_ms"]) / 1000)
         prompt = payload.get("prompt", [])
         prompt_tokens = len(prompt) if isinstance(prompt, list) else len(str(prompt))
         completion_tokens = int(payload.get("max_tokens", 1))
         return {
-            "id": f"mock-{worker_id}-{counters['completions']}",
+            "id": f"mock-{worker_id}-{state['completions']}",
             "object": "text_completion",
             "created": 0,
             "model": payload.get("model", "local-benchmark"),

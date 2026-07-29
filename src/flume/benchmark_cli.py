@@ -800,6 +800,21 @@ def build_command_parser() -> argparse.ArgumentParser:
     )
     local.add_argument("--samples", type=int, default=100)
     local.add_argument("--warmups", type=int, default=10)
+    local.add_argument("--concurrency", type=int, default=8)
+    local.add_argument(
+        "--workload",
+        action="append",
+        choices=[
+            "uniform",
+            "hot_80_20",
+            "shuffled_equivalent",
+            "worker_delay",
+            "worker_failure",
+            "all_unavailable",
+        ],
+        default=[],
+    )
+    local.add_argument("--worker-delay-ms", type=float, default=25.0)
     local.add_argument("--timeout", type=float, default=10.0)
     local.add_argument("--startup-timeout", type=float, default=10.0)
     local.add_argument("--output", type=Path, default=Path("benchmark-local.json"))
@@ -817,8 +832,20 @@ def parse_command_args(arguments: list[str] | None = None) -> argparse.Namespace
             gpu_args = parse_args(arguments[1:])
             gpu_args.command = "gpu"
             return gpu_args
-        if args.samples < 1 or args.warmups < 0:
-            parser.error("--samples must be positive and --warmups cannot be negative")
+        args.workload = args.workload or [
+            "uniform",
+            "hot_80_20",
+            "shuffled_equivalent",
+            "worker_delay",
+            "worker_failure",
+            "all_unavailable",
+        ]
+        if args.samples < 1 or args.concurrency < 1 or args.warmups < 0:
+            parser.error(
+                "--samples and --concurrency must be positive; --warmups cannot be negative"
+            )
+        if args.worker_delay_ms <= 0:
+            parser.error("--worker-delay-ms must be positive")
         return args
     warning = (
         "flat flume-benchmark invocation is deprecated; use `flume-benchmark gpu ...`"
@@ -832,26 +859,24 @@ def parse_command_args(arguments: list[str] | None = None) -> argparse.Namespace
 
 def local_markdown_report(result: dict[str, Any]) -> str:
     config = result["configuration"]
-    measured = result["results"]["measured"]
-    errors = sum(sample["error"] is not None for sample in measured)
-    workers = sorted(
-        {
-            sample["worker_id"]
-            for sample in measured
-            if sample["worker_id"] is not None
-        }
-    )
-    return "\n".join(
-        [
-            "# Flume local benchmark",
-            "",
-            f"- Process-isolated mock workers: `{config['workers']}`",
-            f"- Measured requests: `{len(measured)}`",
-            f"- Errors: `{errors}`",
-            f"- Observed worker ids: `{', '.join(workers)}`",
-            "",
-        ]
-    )
+    lines = [
+        "# Flume local benchmark",
+        "",
+        f"- Process-isolated mock workers: `{config['workers']}`",
+        f"- Requests per distribution workload: `{config['samples']}`",
+        f"- Concurrency: `{config['concurrency']}`",
+        "",
+        "| Workload | Samples | Errors |",
+        "| --- | ---: | ---: |",
+    ]
+    for workload, measurement in result["results"].items():
+        samples = measurement.get("samples")
+        if samples is None:
+            samples = [measurement["sample"]]
+        errors = sum(sample["error"] is not None for sample in samples)
+        lines.append(f"| {workload} | {len(samples)} | {errors} |")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def main(arguments: list[str] | None = None) -> None:
