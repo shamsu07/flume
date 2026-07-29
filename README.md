@@ -70,20 +70,29 @@ Register a pack:
 ```bash
 flume pack create \
   --tenant demo \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --tokenizer meta-llama/Llama-3.1-8B-Instruct \
   examples/policy.txt
 ```
 
 Warm and ask:
 
 ```bash
-flume warm <pack_id>
-flume ask <pack_id> "What are the refund rules?"
+flume warm --tenant demo <pack_id>
+flume ask --tenant demo <pack_id> "What are the refund rules?"
 ```
 
+The service owns the model, tokenizer, and immutable tokenizer revision.
+Clients cannot override them while registering packs or completing prompts.
 Production deployments should use the tenant-scoped `/v1` interface behind an
-authenticated private gateway. See:
+authenticated private gateway:
+
+```bash
+curl http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Flume-Tenant: demo' \
+  -d '{"pack_id":"<pack_id>","prompt":"What are the refund rules?","max_tokens":64}'
+```
+
+See:
 
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)

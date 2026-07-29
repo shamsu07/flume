@@ -12,11 +12,15 @@ deployment secret manager, not an image or Compose file.
 | `FLUME_VLLM_WORKERS` | yes | Comma-separated homogeneous worker base URLs. |
 | `FLUME_DATABASE_URL` | yes | Single-instance SQLite URL under a persistent volume. |
 | `FLUME_REQUEST_TIMEOUT_SECONDS` | no | Upstream request timeout. |
+| `FLUME_CONNECT_TIMEOUT_SECONDS` | no | Upstream connection timeout. |
+| `FLUME_HEALTH_TIMEOUT_SECONDS` | no | Per-worker background health timeout. |
 | `FLUME_MAX_PACK_TOKENS` | no | Maximum compiled prefix length. |
-| `FLUME_MAX_REQUEST_BYTES` | no | Maximum accepted request body. |
+| `FLUME_MAX_REQUEST_BODY_BYTES` | no | Maximum accepted request body. |
+| `FLUME_MAX_OUTPUT_TOKENS` | no | Maximum generated tokens per completion. |
 | `FLUME_MAX_IN_FLIGHT` | no | Global in-flight completion bound. |
 | `FLUME_PACK_CACHE_BYTES` | no | Byte bound for decoded in-memory packs. |
-| `FLUME_HEALTH_INTERVAL_SECONDS` | no | Background worker-health refresh interval. |
+| `FLUME_HEALTH_REFRESH_SECONDS` | no | Background worker-health refresh interval. |
+| `FLUME_SQLITE_BUSY_TIMEOUT_MS` | no | SQLite contention wait before failure. |
 | `FLUME_METRICS_ENABLED` | no | Enable the Prometheus endpoint. |
 
 Tokenizer downloads should be disabled in production after the pinned revision

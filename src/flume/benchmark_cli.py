@@ -315,8 +315,7 @@ def metric_delta(
 ) -> dict[str, dict[str, float]]:
     return {
         worker: {
-            metric: after.get(worker, {}).get(metric, 0.0)
-            - before.get(worker, {}).get(metric, 0.0)
+            metric: after.get(worker, {}).get(metric, 0.0) - before.get(worker, {}).get(metric, 0.0)
             for metric in set(before.get(worker, {})) | set(after.get(worker, {}))
         }
         for worker in set(before) | set(after)
@@ -402,9 +401,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         for scenario in scenarios:
             workers = (
-                args.apc_disabled_worker
-                if scenario == Scenario.apc_disabled
-                else args.apc_worker
+                args.apc_disabled_worker if scenario == Scenario.apc_disabled else args.apc_worker
             )
             if not workers:
                 result["skipped"][scenario] = "no matching worker pool configured"
