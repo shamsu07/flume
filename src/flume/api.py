@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -18,7 +21,13 @@ from flume.config import INSECURE_CACHE_SALT_SECRET, Settings, get_settings
 from flume.metrics import (
     ASK_LATENCY,
     ASKS_TOTAL,
+    IN_FLIGHT,
+    OVERLOADS,
+    PACK_CACHE,
     PACKS_CREATED,
+    REQUEST_LATENCY,
+    REQUESTS_TOTAL,
+    ROUTER_FAILOVERS,
     TTFT,
     WARMUP_LATENCY,
     WARMUPS_TOTAL,
@@ -45,6 +54,7 @@ from flume.vllm import (
 )
 
 TENANT_HEADER = Header(alias="X-Flume-Tenant", min_length=1, max_length=128)
+LOGGER = logging.getLogger("flume.request")
 
 
 class AdmissionController:
@@ -54,12 +64,16 @@ class AdmissionController:
 
     def acquire(self) -> bool:
         if self.current >= self.maximum:
+            OVERLOADS.inc()
             return False
         self.current += 1
+        IN_FLIGHT.inc()
         return True
 
     def release(self) -> None:
-        self.current = max(0, self.current - 1)
+        if self.current > 0:
+            self.current -= 1
+            IN_FLIGHT.dec()
 
 
 def create_app(
@@ -125,21 +139,33 @@ def create_app(
 
     @app.middleware("http")
     async def enforce_body_limit(request: Request, call_next: Any) -> Response:
+        started = time.perf_counter()
+        request_id = uuid.uuid4().hex
+        status_code = 500
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
                 if int(content_length) > settings.max_request_body_bytes:
+                    _record_request(request, 413, started, request_id)
                     return JSONResponse(
                         status_code=413,
                         content={"detail": "request body is too large"},
                     )
             except ValueError:
+                _record_request(request, 400, started, request_id)
                 return JSONResponse(status_code=400, content={"detail": "invalid content-length"})
         body = await request.body()
         if len(body) > settings.max_request_body_bytes:
+            _record_request(request, 413, started, request_id)
             return JSONResponse(status_code=413, content={"detail": "request body is too large"})
         request._body = body
-        return await call_next(request)
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Request-Id"] = request_id
+            return response
+        finally:
+            _record_request(request, status_code, started, request_id)
 
     @app.get("/livez")
     async def livez() -> dict[str, str]:
@@ -186,7 +212,7 @@ def create_app(
         except PackConflictError as exc:
             raise HTTPException(status_code=409, detail="pack identity conflict") from exc
         cache.put(saved)
-        PACKS_CREATED.labels(tenant_id=_metric_tenant(tenant_id)).inc()
+        PACKS_CREATED.inc()
         return saved.to_summary()
 
     @app.get("/v1/packs", response_model=PackPage)
@@ -234,7 +260,7 @@ def create_app(
         salt = _cache_salt(settings, tenant_id)
         started = time.perf_counter()
 
-        async def perform() -> CompletionResult:
+        async def perform() -> tuple[CompletionResult, str]:
             return await _complete_with_failover(
                 router=router,
                 vllm=vllm,
@@ -251,16 +277,19 @@ def create_app(
             )
 
         try:
-            await warmups.run((tenant_id, pack_id, worker_url), perform)
+            _, actual_worker = await warmups.run((tenant_id, pack_id, worker_url), perform)
         except VLLMError as exc:
-            WARMUPS_TOTAL.labels(worker_url=_worker_id(worker_url), status="failed").inc()
+            WARMUPS_TOTAL.labels(worker_id=_worker_id(worker_url), outcome="failed").inc()
             raise HTTPException(status_code=502, detail="vLLM warmup failed") from exc
+        except NoHealthyWorkers as exc:
+            WARMUPS_TOTAL.labels(worker_id=_worker_id(worker_url), outcome="unavailable").inc()
+            raise HTTPException(status_code=503, detail="no healthy vLLM workers") from exc
         latency_ms = (time.perf_counter() - started) * 1000
-        WARMUPS_TOTAL.labels(worker_url=_worker_id(worker_url), status="ok").inc()
+        WARMUPS_TOTAL.labels(worker_id=_worker_id(actual_worker), outcome="ok").inc()
         WARMUP_LATENCY.observe(latency_ms / 1000)
         return WarmResponse(
             pack_id=pack_id,
-            worker_url=worker_url,
+            worker_url=actual_worker,
             warmed=True,
             latency_ms=latency_ms,
         )
@@ -281,10 +310,13 @@ def create_app(
             raise HTTPException(status_code=429, detail="server is at its in-flight limit")
 
         stream_handed_off = False
-        runtime_compiler = _require_compiler(app)
+        metric_worker = "unassigned"
+        outcome = "failed"
         try:
+            runtime_compiler = _require_compiler(app)
             pack = await _load_pack(store, cache, tenant_id, request.pack_id)
-            worker_url = await _choose_worker(router, request.pack_id)
+            worker_url = await router.choose(request.pack_id)
+            metric_worker = _worker_id(worker_url)
             prompt = runtime_compiler.completion_token_ids(pack, request.question)
             salt = _cache_salt(settings, tenant_id)
             headers = {
@@ -304,6 +336,7 @@ def create_app(
                     cache_salt=salt,
                 )
                 headers["X-Flume-Worker-Url"] = actual_worker
+                metric_worker = _worker_id(actual_worker)
                 stream_handed_off = True
                 return StreamingResponse(
                     _stream_with_release(stream, admission, actual_worker),
@@ -327,10 +360,8 @@ def create_app(
                 cache_salt=salt,
             )
             ASK_LATENCY.observe(time.perf_counter() - started)
-            ASKS_TOTAL.labels(
-                worker_url=_worker_id(actual_worker),
-                stream="false",
-            ).inc()
+            metric_worker = _worker_id(actual_worker)
+            outcome = "ok"
             headers["X-Flume-Worker-Url"] = actual_worker
             body = {
                 "id": f"cmpl-{uuid.uuid4().hex}",
@@ -354,13 +385,21 @@ def create_app(
             }
             return JSONResponse(body, headers=headers)
         except NoHealthyWorkers as exc:
+            outcome = "unavailable"
             raise HTTPException(status_code=503, detail="no healthy vLLM workers") from exc
         except ValueError as exc:
+            outcome = "rejected"
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except VLLMError as exc:
+            outcome = "upstream_error"
             raise HTTPException(status_code=502, detail="vLLM request failed") from exc
         finally:
             if not stream_handed_off:
+                ASKS_TOTAL.labels(
+                    worker_id=metric_worker,
+                    stream="false",
+                    outcome=outcome,
+                ).inc()
                 admission.release()
 
     @app.get("/v1/stats", response_model=StatsResponse)
@@ -409,7 +448,9 @@ async def _load_pack(
 ) -> ContextPack:
     pack = cache.get(tenant_id, pack_id)
     if pack is not None:
+        PACK_CACHE.labels(result="hit").inc()
         return pack
+    PACK_CACHE.labels(result="miss").inc()
     pack = await store.get_pack(tenant_id, pack_id)
     if pack is None:
         raise HTTPException(status_code=404, detail="context pack not found")
@@ -463,6 +504,7 @@ async def _complete_with_failover(
         )
         return result, worker_url
     except VLLMConnectionError:
+        ROUTER_FAILOVERS.labels(operation="completion").inc()
         router.mark_unhealthy(worker_url)
         replacement = await router.choose(pack_id, exclude={worker_url})
         result = await vllm.complete(
@@ -506,6 +548,7 @@ async def _open_stream_with_failover(
         stream = await vllm.open_stream_completion(worker_url=worker_url, **kwargs)
         return stream, worker_url
     except VLLMConnectionError:
+        ROUTER_FAILOVERS.labels(operation="stream").inc()
         router.mark_unhealthy(worker_url)
         replacement = await router.choose(pack_id, exclude={worker_url})
         stream = await vllm.open_stream_completion(worker_url=replacement, **kwargs)
@@ -517,17 +560,56 @@ async def _stream_with_release(
     admission: AdmissionController,
     worker_url: str,
 ) -> AsyncIterator[bytes]:
+    outcome = "ok"
     try:
         async for chunk in stream:
             yield chunk
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    except Exception:
+        outcome = "failed"
+        raise
     finally:
-        ASKS_TOTAL.labels(worker_url=_worker_id(worker_url), stream="true").inc()
+        ASKS_TOTAL.labels(
+            worker_id=_worker_id(worker_url),
+            stream="true",
+            outcome=outcome,
+        ).inc()
         admission.release()
-
-
-def _metric_tenant(tenant_id: str) -> str:
-    return hashlib.sha256(tenant_id.encode()).hexdigest()[:12]
 
 
 def _worker_id(worker_url: str) -> str:
     return hashlib.sha256(worker_url.encode()).hexdigest()[:12]
+
+
+def _record_request(
+    request: Request,
+    status_code: int,
+    started: float,
+    request_id: str,
+) -> None:
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", "unmatched")
+    route_label = route_path if route_path.startswith("/") else "unmatched"
+    duration = time.perf_counter() - started
+    REQUESTS_TOTAL.labels(
+        route=route_label,
+        method=request.method,
+        status_class=f"{status_code // 100}xx",
+    ).inc()
+    REQUEST_LATENCY.labels(route=route_label).observe(duration)
+    LOGGER.info(
+        json.dumps(
+            {
+                "event": "request_completed",
+                "request_id": request_id,
+                "method": request.method,
+                "route": route_label,
+                "status": status_code,
+                "duration_ms": round(duration * 1000, 3),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )

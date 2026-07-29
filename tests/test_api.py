@@ -1,4 +1,6 @@
 import json
+import logging
+from unittest.mock import AsyncMock
 
 import httpx
 from fastapi.testclient import TestClient
@@ -132,3 +134,64 @@ def test_tenant_header_is_required_and_reserved_fields_are_rejected(tmp_path) ->
 
     assert response.status_code == 422
     assert "reserved" in response.json()["detail"]
+
+
+def test_hot_completion_avoids_store_and_health_and_logs_are_redacted(
+    tmp_path,
+    caplog,
+) -> None:
+    payloads: list[dict] = []
+    health_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal health_calls
+        if request.url.path == "/health":
+            health_calls += 1
+            return httpx.Response(200)
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"text": "answer", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 1},
+            },
+        )
+
+    tokenizer = DeterministicByteTokenizer(tokenizer_id="tokenizer", revision="byte-v1")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'flume.db'}",
+            vllm_workers=["http://worker"],
+            model_id="model",
+            tokenizer_id="tokenizer",
+            tokenizer_revision="byte-v1",
+            cache_salt_secret="test-secret-that-is-at-least-thirty-two-bytes",
+            health_refresh_seconds=60,
+        ),
+        compiler=ContextPackCompiler(tokenizer, model_id="model"),
+        vllm_transport=httpx.MockTransport(handler),
+    )
+    caplog.set_level(logging.INFO, logger="flume.request")
+    with TestClient(app) as client:
+        pack = register_pack(client, tenant="sensitive-customer")
+        startup_health_calls = health_calls
+        app.state.store.get_pack = AsyncMock(side_effect=AssertionError("hot path hit SQLite"))
+
+        response = client.post(
+            "/v1/completions",
+            headers={"X-Flume-Tenant": "sensitive-customer"},
+            json={
+                "pack_id": pack["pack_id"],
+                "question": "secret question content",
+                "max_tokens": 1,
+            },
+        )
+        metrics = client.get("/metrics").text
+
+    assert response.status_code == 200
+    assert health_calls == startup_health_calls
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "secret question content" not in logs
+    assert "sensitive-customer" not in logs
+    assert "sensitive-customer" not in metrics
+    assert "http://worker" not in metrics

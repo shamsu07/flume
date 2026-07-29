@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import TypeVar
 
+from flume.metrics import ROUTER_AFFINITY, ROUTER_UNAVAILABLE
+
 HealthChecker = Callable[[str], Awaitable[bool]]
 T = TypeVar("T")
 
@@ -80,13 +82,16 @@ class PackRouter:
             if self._health.get(worker, False) and worker not in excluded
         ]
         if not candidates:
+            ROUTER_UNAVAILABLE.inc()
             raise NoHealthyWorkers("no healthy vLLM workers")
         worker = max(candidates, key=lambda item: self._score(pack_id, item))
         previous = self._assignments.get(pack_id)
         if previous == worker:
             self._affinity["hit"] += 1
+            ROUTER_AFFINITY.labels(result="hit").inc()
         else:
             self._affinity["miss"] += 1
+            ROUTER_AFFINITY.labels(result="miss").inc()
             self._assignments[pack_id] = worker
         return worker
 
@@ -113,7 +118,7 @@ class PackRouter:
     @staticmethod
     def _score(pack_id: str, worker_url: str) -> int:
         digest = hashlib.blake2b(
-            f"{pack_id}\0{worker_url}".encode("utf-8"),
+            f"{pack_id}\0{worker_url}".encode(),
             digest_size=16,
             person=b"flume-route-v1",
         ).digest()
