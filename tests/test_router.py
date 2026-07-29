@@ -64,6 +64,22 @@ async def test_rendezvous_hashing_has_bounded_remapping() -> None:
     assert changed / len(pack_ids) <= (1 / 4) + 0.02
 
 
+def test_router_tracks_local_in_flight_without_underflow() -> None:
+    router = PackRouter(["http://a"])
+
+    router.acquire("http://a")
+    router.acquire("http://a")
+    router.release("http://a")
+    assert router.local_in_flight("http://a") == 1
+
+    router.release("http://a")
+    router.release("http://a")
+    assert router.local_in_flight("http://a") == 0
+
+    with pytest.raises(ValueError, match="not managed"):
+        router.acquire("http://unknown")
+
+
 @pytest.mark.asyncio
 async def test_warmup_singleflight_coalesces_operations() -> None:
     singleflight = WarmupSingleFlight()

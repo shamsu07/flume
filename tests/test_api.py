@@ -136,6 +136,7 @@ def test_completion_uses_integer_prompt_and_hmac_tenant_salt(tmp_path) -> None:
     assert all(isinstance(token_id, int) for token_id in payloads[-1]["prompt"])
     assert payloads[-1]["cache_salt"] != "demo"
     assert len(payloads[-1]["cache_salt"]) == 64
+    assert app.state.router.local_in_flight("http://worker") == 0
 
 
 def test_tenant_header_is_required_and_reserved_fields_are_rejected(tmp_path) -> None:
@@ -282,6 +283,8 @@ def test_api_failover_tries_two_distinct_workers_once(tmp_path) -> None:
     assert len(set(completion_hosts)) == 2
     assert response.headers["X-Flume-Worker-Id"]
     assert all(host not in response.text for host in completion_hosts)
+    assert app.state.router.local_in_flight("http://worker-a") == 0
+    assert app.state.router.local_in_flight("http://worker-b") == 0
 
 
 def test_stream_upstream_error_is_translated_before_sse_headers(tmp_path) -> None:

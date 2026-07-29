@@ -37,6 +37,7 @@ class PackRouter:
         self._monitor_task: asyncio.Task[None] | None = None
         self._assignments: dict[str, str] = {}
         self._affinity: Counter[str] = Counter()
+        self._local_in_flight: Counter[str] = Counter()
 
     async def start(self) -> None:
         if self.health_checker is None or self._monitor_task is not None:
@@ -101,6 +102,21 @@ class PackRouter:
             updated = dict(self._health)
             updated[worker_url] = False
             self._health = updated
+
+    def acquire(self, worker_url: str) -> None:
+        if worker_url not in self._health:
+            raise ValueError("worker is not managed by this router")
+        self._local_in_flight[worker_url] += 1
+
+    def release(self, worker_url: str) -> None:
+        current = self._local_in_flight[worker_url]
+        if current <= 1:
+            self._local_in_flight.pop(worker_url, None)
+        else:
+            self._local_in_flight[worker_url] = current - 1
+
+    def local_in_flight(self, worker_url: str) -> int:
+        return self._local_in_flight[worker_url]
 
     def health(self) -> dict[str, bool]:
         return dict(self._health)

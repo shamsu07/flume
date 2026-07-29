@@ -488,35 +488,43 @@ async def _complete_with_failover(
     extra_body: dict[str, Any] | None,
     cache_salt: str,
 ) -> tuple[CompletionResult, str]:
+    active_worker = worker_url
+    router.acquire(active_worker)
     try:
-        result = await vllm.complete(
-            worker_url=worker_url,
-            model=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop,
-            extra_body=extra_body,
-            cache_salt=cache_salt,
-        )
-        return result, worker_url
-    except VLLMConnectionError:
-        ROUTER_FAILOVERS.labels(operation="completion").inc()
-        router.mark_unhealthy(worker_url)
-        replacement = await router.choose(pack_id, exclude={worker_url})
-        result = await vllm.complete(
-            worker_url=replacement,
-            model=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop,
-            extra_body=extra_body,
-            cache_salt=cache_salt,
-        )
-        return result, replacement
+        try:
+            result = await vllm.complete(
+                worker_url=active_worker,
+                model=model,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                extra_body=extra_body,
+                cache_salt=cache_salt,
+            )
+            return result, active_worker
+        except VLLMConnectionError:
+            ROUTER_FAILOVERS.labels(operation="completion").inc()
+            router.mark_unhealthy(active_worker)
+            router.release(active_worker)
+            replacement = await router.choose(pack_id, exclude={active_worker})
+            active_worker = replacement
+            router.acquire(active_worker)
+            result = await vllm.complete(
+                worker_url=active_worker,
+                model=model,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                extra_body=extra_body,
+                cache_salt=cache_salt,
+            )
+            return result, active_worker
+    finally:
+        router.release(active_worker)
 
 
 async def _open_stream_with_failover(
@@ -542,18 +550,35 @@ async def _open_stream_with_failover(
             extra_body=request.extra_body,
             cache_salt=cache_salt,
             on_first_token=lambda value: TTFT.observe(value / 1000),
-            on_done=lambda value: ASK_LATENCY.observe(value / 1000),
+            on_done=lambda value: _finish_worker_stream(router, target_worker, value),
         )
 
+    active_worker = worker_url
+    router.acquire(active_worker)
     try:
-        stream = await open_stream(worker_url)
-        return stream, worker_url
+        stream = await open_stream(active_worker)
+        return stream, active_worker
     except VLLMConnectionError:
         ROUTER_FAILOVERS.labels(operation="stream").inc()
-        router.mark_unhealthy(worker_url)
-        replacement = await router.choose(pack_id, exclude={worker_url})
-        stream = await open_stream(replacement)
-        return stream, replacement
+        router.mark_unhealthy(active_worker)
+        router.release(active_worker)
+        replacement = await router.choose(pack_id, exclude={active_worker})
+        active_worker = replacement
+        router.acquire(active_worker)
+        try:
+            stream = await open_stream(active_worker)
+            return stream, active_worker
+        except Exception:
+            router.release(active_worker)
+            raise
+    except Exception:
+        router.release(active_worker)
+        raise
+
+
+def _finish_worker_stream(router: PackRouter, worker_url: str, latency_ms: float) -> None:
+    ASK_LATENCY.observe(latency_ms / 1000)
+    router.release(worker_url)
 
 
 async def _stream_with_release(

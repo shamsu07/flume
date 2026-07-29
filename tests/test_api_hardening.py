@@ -339,6 +339,7 @@ def test_fragmented_stream_is_forwarded_and_releases_admission(tmp_path: Any) ->
     assert streamed.status_code == 200
     assert streamed.content == raw
     assert following.status_code == 200
+    assert app.state.router.local_in_flight("http://worker") == 0
 
 
 def test_streaming_error_releases_admission(tmp_path: Any) -> None:
@@ -366,6 +367,7 @@ def test_streaming_error_releases_admission(tmp_path: Any) -> None:
         )
 
     assert following.status_code == 200
+    assert app.state.router.local_in_flight("http://worker") == 0
 
 
 @pytest.mark.asyncio
