@@ -11,9 +11,8 @@ def test_health_endpoint(tmp_path) -> None:
             vllm_workers=["http://localhost:8000"],
         )
     )
-    client = TestClient(app)
-
-    response = client.get("/health")
+    with TestClient(app) as client:
+        response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -26,20 +25,19 @@ def test_create_and_get_pack(tmp_path) -> None:
             vllm_workers=["http://localhost:8000"],
         )
     )
-    client = TestClient(app)
+    with TestClient(app) as client:
+        response = client.post(
+            "/packs",
+            json={
+                "tenant_id": "demo",
+                "model_id": "model",
+                "tokenizer_id": "tokenizer",
+                "chunks": [{"doc_id": "doc", "text": "hello"}],
+            },
+        )
 
-    response = client.post(
-        "/packs",
-        json={
-            "tenant_id": "demo",
-            "model_id": "model",
-            "tokenizer_id": "tokenizer",
-            "chunks": [{"doc_id": "doc", "text": "hello"}],
-        },
-    )
-
-    assert response.status_code == 200
-    pack = response.json()
-    loaded = client.get(f"/packs/{pack['pack_id']}")
-    assert loaded.status_code == 200
-    assert loaded.json()["pack_id"] == pack["pack_id"]
+        assert response.status_code == 200
+        pack = response.json()
+        loaded = client.get(f"/packs/{pack['pack_id']}")
+        assert loaded.status_code == 200
+        assert loaded.json()["pack_id"] == pack["pack_id"]

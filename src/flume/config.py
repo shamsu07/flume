@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, PositiveFloat, PositiveInt, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,9 +17,19 @@ class Settings(BaseSettings):
     vllm_workers: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
     model_id: str = "local-model"
     tokenizer_id: str = "local-tokenizer"
+    tokenizer_revision: str = "main"
     allow_remote_tokenizer: bool = False
-    request_timeout_seconds: float = 120.0
+    request_timeout_seconds: PositiveFloat = 120.0
+    connect_timeout_seconds: PositiveFloat = 5.0
+    health_timeout_seconds: PositiveFloat = 2.0
+    health_refresh_seconds: PositiveFloat = 5.0
     max_pack_tokens: int | None = None
+    max_request_body_bytes: PositiveInt = 1_048_576
+    max_output_tokens: PositiveInt = 4_096
+    max_in_flight: PositiveInt = 256
+    pack_cache_bytes: PositiveInt = 256 * 1024 * 1024
+    sqlite_busy_timeout_ms: PositiveInt = 5_000
+    cache_salt_secret: str = "development-only-change-before-production"
     metrics_enabled: bool = True
 
     @field_validator("vllm_workers", mode="before")

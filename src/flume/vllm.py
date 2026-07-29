@@ -20,13 +20,45 @@ class CompletionResult:
 
 
 class VLLMClient:
-    def __init__(self, timeout_seconds: float = 120.0):
+    def __init__(
+        self,
+        timeout_seconds: float = 120.0,
+        *,
+        connect_timeout_seconds: float = 5.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.timeout_seconds = timeout_seconds
+        self.connect_timeout_seconds = connect_timeout_seconds
+        self.transport = transport
+        self._client: httpx.AsyncClient | None = None
+
+    async def start(self) -> None:
+        if self._client is not None:
+            return
+        timeout = httpx.Timeout(self.timeout_seconds, connect=self.connect_timeout_seconds)
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            transport=self.transport,
+            limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
+        )
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            raise RuntimeError("vLLM client has not been started")
+        return self._client
 
     async def health(self, worker_url: str) -> bool:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{worker_url.rstrip('/')}/health")
-            return response.status_code < 500
+        response = await self.client.get(
+            f"{worker_url.rstrip('/')}/health",
+            timeout=self.connect_timeout_seconds,
+        )
+        return response.status_code < 500
 
     async def complete(
         self,
@@ -54,10 +86,12 @@ class VLLMClient:
             payload.update(extra_body)
 
         started = time.perf_counter()
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(f"{worker_url.rstrip('/')}/v1/completions", json=payload)
-            response.raise_for_status()
-            body = response.json()
+        response = await self.client.post(
+            f"{worker_url.rstrip('/')}/v1/completions",
+            json=payload,
+        )
+        response.raise_for_status()
+        body = response.json()
         latency_ms = (time.perf_counter() - started) * 1000
 
         choice = (body.get("choices") or [{}])[0]
@@ -100,24 +134,23 @@ class VLLMClient:
 
         started = time.perf_counter()
         first_token_seen = False
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST",
-                f"{worker_url.rstrip('/')}/v1/completions",
-                json=payload,
-                timeout=self.timeout_seconds,
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line:
-                        yield b"\n"
-                        continue
-                    if not first_token_seen and self._line_has_token(line):
-                        first_token_seen = True
-                        ttft_ms = (time.perf_counter() - started) * 1000
-                        if on_first_token:
-                            on_first_token(ttft_ms)
-                    yield f"{line}\n\n".encode()
+        async with self.client.stream(
+            "POST",
+            f"{worker_url.rstrip('/')}/v1/completions",
+            json=payload,
+            timeout=self.timeout_seconds,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line:
+                    yield b"\n"
+                    continue
+                if not first_token_seen and self._line_has_token(line):
+                    first_token_seen = True
+                    ttft_ms = (time.perf_counter() - started) * 1000
+                    if on_first_token:
+                        on_first_token(ttft_ms)
+                yield f"{line}\n\n".encode()
         latency_ms = (time.perf_counter() - started) * 1000
         if on_done:
             on_done(latency_ms)

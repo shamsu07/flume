@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
@@ -39,9 +40,11 @@ from flume.vllm import VLLMClient
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     store = FlumeStore(settings.database_url)
-    store.init_schema()
     compiler = ContextPackCompiler(allow_remote_tokenizer=settings.allow_remote_tokenizer)
-    vllm = VLLMClient(timeout_seconds=settings.request_timeout_seconds)
+    vllm = VLLMClient(
+        timeout_seconds=settings.request_timeout_seconds,
+        connect_timeout_seconds=settings.connect_timeout_seconds,
+    )
     router = PackRouter(settings.vllm_workers, store, health_checker=vllm.health)
     bench = BenchmarkRunner(
         store=store,
@@ -51,10 +54,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings=settings,
     )
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        store.init_schema()
+        await vllm.start()
+        try:
+            yield
+        finally:
+            await vllm.close()
+
     app = FastAPI(
         title="Flume",
         version="0.1.0",
         description="RAG cache compiler and vLLM serving proxy.",
+        lifespan=lifespan,
     )
     app.state.settings = settings
     app.state.store = store
