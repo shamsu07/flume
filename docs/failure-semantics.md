@@ -24,3 +24,8 @@ response promptly.
 `/livez` means the process event loop is alive. `/readyz` additionally requires
 the database, pinned tokenizer, and at least one healthy vLLM worker. A failed
 readiness probe is not evidence that every in-flight request failed.
+
+When experimental `bounded_hrw` is enabled, a missing, invalid, or stale load
+snapshot for any healthy candidate is not an upstream request failure. That
+routing decision uses pure HRW and records a stale fallback. Local in-flight
+counts alone never trigger a spill in this state.

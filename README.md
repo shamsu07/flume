@@ -1,7 +1,7 @@
 # Flume
 
-Flume is a RAG cache compiler and vLLM serving proxy. It helps repeated
-long-context RAG workloads get more value from vLLM Automatic Prefix Caching by
+Flume is a RAG cache compiler and vLLM serving proxy. It is designed to help
+repeated long-context RAG workloads reuse vLLM Automatic Prefix Caching by
 turning retrieved documents into deterministic, versioned, cache-stable context
 packs.
 
@@ -18,9 +18,11 @@ document context:
 system prompt + retrieved document pack + user question
 ```
 
-vLLM can reuse KV cache for shared prefixes, but real applications often lose
+vLLM can reuse KV cache for shared prefixes, but applications can lose
 those hits through unstable chunk ordering, drifting templates, routing across
-replicas, or lack of warmup/metrics. Flume makes that reuse intentional.
+replicas, or lack of warmup/metrics. Flume provides controls intended to make
+that reuse deliberate; the repository does not yet contain a validated real-GPU
+comparison proving an improvement.
 
 ## Architecture
 
@@ -36,6 +38,26 @@ Flume FastAPI proxy
     v
 vLLM OpenAI-compatible workers with prefix caching enabled
 ```
+
+The default router is deterministic health-aware HRW. The load-informed
+`bounded_hrw` policy is experimental and disabled by default; enable it only
+with `FLUME_ROUTING_POLICY=bounded_hrw`. It falls back to pure HRW whenever any
+healthy candidate lacks a fresh vLLM load snapshot.
+
+## Evidence limits
+
+Current repository evidence is limited to local process-isolated mock workers.
+A paired loopback methodology for a Mac is documented, but no numeric result is
+asserted here. Local runs can validate harness accounting, failure handling,
+topology, and proxy behavior. They do not validate CUDA/GPU execution, vLLM APC
+hit-rate gains, production tail latency, throughput gains, or cost improvements.
+
+Real GPU/APC comparisons remain unvalidated and benchmark provenance must remain
+`gpu_validated=false` unless an operator runs and attests the documented GPU
+matrix. Do not use the local evidence to claim that Flume is faster or otherwise
+superior to direct vLLM, NVIDIA Dynamo, LMCache, or another cache/routing system.
+See [Benchmarks](docs/benchmarks.md) for the paired methodology and required
+provenance.
 
 ## Quickstart
 

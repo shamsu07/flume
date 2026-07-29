@@ -31,6 +31,37 @@ deployment secret manager, not an image or Compose file.
 | `FLUME_SQLITE_BUSY_TIMEOUT_MS` | no | SQLite contention wait before failure. |
 | `FLUME_METRICS_ENABLED` | no | Enable the Prometheus endpoint. |
 
+## Experimental bounded HRW
+
+Bounded-load routing is disabled by default. With the default
+`FLUME_ROUTING_POLICY=hrw`, Flume does not poll vLLM request-load metrics and
+always selects the healthy rendezvous primary.
+
+To opt in, set `FLUME_ROUTING_POLICY=bounded_hrw`. The remaining routing
+defaults are:
+
+| Setting | Default |
+| --- | --- |
+| `FLUME_ROUTING_LOAD_SLACK` | `2` |
+| `FLUME_ROUTING_SPILL_HOLD_MS` | `2000` |
+| `FLUME_WORKER_LOAD_REFRESH_MS` | `500` |
+| `FLUME_WORKER_LOAD_STALE_MS` | `2000` |
+| `FLUME_WORKER_CAPACITY_WEIGHTS` | `1.0` for each omitted worker |
+| `FLUME_ROUTING_STATE_MAX_ENTRIES` | `10000` |
+| `FLUME_ROUTING_STATE_TTL_SECONDS` | `600` |
+
+The effective load is
+`max(local in-flight, upstream running + upstream waiting) / capacity weight`.
+Flume retains the HRW primary while it is within the configured slack of the
+global minimum. Otherwise it chooses the highest-HRW-ranked eligible
+non-primary and holds that spill only while the target remains within the load
+bound.
+
+Every healthy candidate must have a valid, fresh vLLM running/waiting snapshot
+for a bounded decision. If one is missing, invalid, or stale, Flume ignores
+local load for that decision and falls back to pure HRW. This is a
+process-local experimental policy, not a distributed cache-aware router.
+
 Tokenizer downloads should be disabled in production after the pinned revision
 is baked or mounted. Changing model, tokenizer, revision, compiler format, or
 template invalidates existing packs and requires registration under the new

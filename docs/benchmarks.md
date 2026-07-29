@@ -3,6 +3,27 @@
 Benchmarks are offline operator tools. The serving API does not run long-lived
 benchmark jobs or persist benchmark rows.
 
+## Evidence status
+
+The evidence currently documented for this release is local-only:
+
+- Flume and mock workers run as separate processes on one machine over loopback.
+- The mock workers expose synthetic cache and load counters.
+- A paired Mac proxy methodology is specified below; no result is asserted here.
+- Real GPU/APC comparison results have not been validated.
+
+This evidence can validate request accounting, topology, routing/failure
+behavior, and local proxy overhead methodology. It cannot establish GPU cache
+hit rates, GPU TTFT or throughput improvements, production scalability, or
+relative performance against direct vLLM, NVIDIA Dynamo, LMCache, or any other
+runtime/cache system. A threshold described below is an acceptance criterion,
+not evidence that a particular checkout has passed it.
+
+Repository results and reports must retain `gpu_validated=false` unless the
+operator has run the declared real-GPU matrix and explicitly supplied
+`--gpu-validated`. Do not summarize mock or Mac loopback measurements as
+GPU/APC results or as a superiority claim.
+
 ## Apple M5 paired performance gate
 
 `mac-gate` is a local-only comparison gate for clean source worktrees on an
@@ -59,6 +80,11 @@ starts; the small bind race is bounded by three collision retries, so this
 harness is intended for a single-host local benchmark rather than distributed
 or adversarial multi-process orchestration.
 
+Process isolation here means distinct operating-system processes. It does not
+provide separate hosts, independent CPU scheduling, isolated memory bandwidth,
+or a production network. Results can be affected by loopback, host contention,
+power state, and thermal state.
+
 ## Local proxy overhead
 
 The local harness starts a counted mock vLLM and, unless `--proxy-url` is given,
@@ -76,6 +102,26 @@ The acceptance gate is zero errors, incremental p99 proxy overhead at most 10 ms
 and proxy throughput at least 90% of direct. The upstream health counter must
 not increase once per warm proxy request. Keep the committed unoptimized
 baseline immutable; write later comparisons to a new file.
+
+### Paired Mac methodology
+
+Treat local proxy evidence as a paired comparison, not an absolute performance
+claim:
+
+1. Use the same Mac, power mode, Python/dependency environment, loopback
+   topology, request plan, seed, concurrency, and warmup settings for both
+   members of a pair.
+2. Compare direct-to-mock and Flume-to-the-same-mock runs close together in time.
+   Alternate their order across repeated pairs when practical to reduce thermal
+   and background-load bias.
+3. Record the tested commit, clean/dirty state, operating system, hardware,
+   process topology, command, and raw samples for each member.
+4. Compare paired deltas and variability; do not combine unmatched runs or
+   extrapolate the result to another machine, network, model, or GPU.
+5. Label the result local/mock and keep `gpu_validated=false`.
+
+No numeric result should be treated as release evidence until both members of
+the pair and their provenance have been reviewed.
 
 ## GPU and APC scenarios
 
@@ -119,6 +165,7 @@ snapshots. Schema-versioned provenance defaults to `gpu_validated=false`; pass
 `--gpu-validated` only as an operator attestation that the declared workers are
 the GPU environment being measured. The result labels that basis as
 `operator_attested`; the harness does not claim to verify GPU hardware.
+No real-GPU run is validated merely because this command or harness exists.
 Runtime and build provenance comes from the benchmark process and its local Git
 checkout. `--tested-commit` separately records the installed Flume package
 revision under test; the working-directory Git state is never presented as
@@ -128,3 +175,7 @@ package provenance. A run with any requested scenario skipped is written with
 when a phase contains at least 1,000 successful samples. Compare runs only when
 hardware, model/tokenizer/vLLM revisions, topology, context lengths, concurrency,
 and cache state are equivalent.
+
+Even a validated run supports only the declared environment and comparison.
+Report observed metrics and uncertainty; do not convert them into general
+claims that Flume is superior to direct vLLM, Dynamo, LMCache, or other systems.
