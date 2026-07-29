@@ -8,6 +8,7 @@ import pytest
 
 import flume.benchmark_cli as benchmark
 from flume.benchmark_cli import (
+    FlumeSamplePlan,
     Sample,
     SamplePlan,
     Scenario,
@@ -23,6 +24,7 @@ from flume.benchmark_cli import (
     metric_delta,
     metrics_snapshot,
     parse_args,
+    parse_command_args,
     parse_prometheus,
     percentile,
     run_benchmark,
@@ -34,6 +36,10 @@ class FakeTokenizer:
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         assert add_special_tokens is False
         return [ord(character) for character in text]
+
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        assert skip_special_tokens is True
+        return "".join(chr(token_id) for token_id in token_ids)
 
 
 def test_exact_prefix_has_requested_token_length() -> None:
@@ -57,23 +63,6 @@ def test_unstable_scenario_changes_prefix_but_not_length() -> None:
 
     assert len(plans[0].prompt_token_ids) == len(plans[1].prompt_token_ids)
     assert plans[0].prompt_token_ids[:32] != plans[1].prompt_token_ids[:32]
-
-
-def test_affinity_scenario_keeps_one_worker() -> None:
-    plans = build_sample_plans(
-        tokenizer=FakeTokenizer(),
-        scenario=Scenario.stable_warmed_prefix_affinity,
-        workers=["http://worker-1", "http://worker-2"],
-        context_length=16,
-        phase="warm",
-        samples=20,
-        max_output_tokens=8,
-        run_salt="test",
-        seed=1,
-    )
-
-    assert len({plan.worker_url for plan in plans}) == 1
-    assert len({tuple(plan.prompt_token_ids[:16]) for plan in plans}) == 1
 
 
 def test_p99_is_only_published_with_enough_samples() -> None:
@@ -153,23 +142,23 @@ def test_percentiles_and_tokenizer_failures() -> None:
 
 def test_worker_selection_and_salt_policies() -> None:
     workers = ["http://one", "http://two"]
-    affinity = choose_worker(
+    selected = choose_worker(
         Scenario.stable_warmed_prefix_affinity,
         workers,
         index=1,
         affinity_identity="pack",
         seed=4,
     )
-    assert affinity in workers
+    assert selected in workers
     assert (
         choose_worker(
             Scenario.stable_warmed_prefix_affinity,
             workers,
-            index=99,
+            index=1,
             affinity_identity="pack",
-            seed=100,
+            seed=4,
         )
-        == affinity
+        == selected
     )
     cold = build_sample_plans(
         tokenizer=FakeTokenizer(),
@@ -236,6 +225,55 @@ async def test_sample_errors_and_concurrent_execution() -> None:
 
 
 @pytest.mark.asyncio
+async def test_flume_sample_uses_public_completion_contract() -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["tenant"] = request.headers["X-Flume-Tenant"]
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "X-Flume-Worker-Id": "worker-public-id",
+                "X-Flume-Prompt-Tokens": "42",
+            },
+            content=(
+                b'data: {"choices":[{"text":"x"}]}\n\n'
+                b'data: {"choices":[],"usage":{"completion_tokens":1}}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+        )
+
+    plan = FlumeSamplePlan(
+        index=0,
+        phase="warm",
+        flume_url="http://flume",
+        pack_id="pack-1",
+        tenant_id="tenant-1",
+        prompt="question",
+        max_tokens=1,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sample = await benchmark.execute_flume_sample(client, plan)
+
+    assert seen == {
+        "path": "/v1/completions",
+        "tenant": "tenant-1",
+        "body": {
+            "pack_id": "pack-1",
+            "prompt": "question",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": True,
+        },
+    }
+    assert sample.worker_url == "worker-public-id"
+    assert sample.prompt_tokens == 42
+
+
+@pytest.mark.asyncio
 async def test_metrics_snapshots_tolerate_unavailable_workers() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "bad":
@@ -289,6 +327,8 @@ def benchmark_args() -> Namespace:
         seed=1,
         timeout=2.0,
         collect_metrics=True,
+        flume_url="http://flume",
+        tenant="benchmark",
     )
 
 
@@ -329,6 +369,50 @@ async def test_full_benchmark_orchestration_and_report(monkeypatch) -> None:
 
     monkeypatch.setattr(benchmark, "metrics_snapshot", fake_snapshot)
     monkeypatch.setattr(benchmark, "execute_plans", fake_execute)
+    monkeypatch.setattr(
+        benchmark,
+        "register_flume_pack",
+        lambda *args, **kwargs: benchmark.asyncio.sleep(
+            0,
+            result={"pack_id": "pack-1", "token_count": 9},
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "warm_flume_pack",
+        lambda *args, **kwargs: benchmark.asyncio.sleep(
+            0,
+            result={"pack_id": "pack-1", "worker_id": "worker", "warmed": True},
+        ),
+    )
+
+    async def fake_flume_execute(
+        client: object,
+        plans: list[FlumeSamplePlan],
+        *,
+        concurrency: int,
+    ) -> tuple[list[Sample], float]:
+        del client, concurrency
+        return (
+            [
+                Sample(
+                    plan.index,
+                    plan.phase,
+                    "public-worker-id",
+                    plan.max_tokens,
+                    9,
+                    1,
+                    1.0,
+                    2.0,
+                    200,
+                    None,
+                )
+                for plan in plans
+            ],
+            0.5,
+        )
+
+    monkeypatch.setattr(benchmark, "execute_flume_plans", fake_flume_execute)
 
     result = await run_benchmark(benchmark_args())
     report = markdown_report(result)
@@ -381,6 +465,8 @@ def test_parser_defaults_and_validation() -> None:
             "v0.22.0",
             "--apc-worker",
             "http://worker",
+            "--flume-url",
+            "http://flume",
         ]
     )
     assert args.context_length == [4096, 16384, 65536]
@@ -405,9 +491,34 @@ def test_parser_defaults_and_validation() -> None:
         parse_args([*base, "--apc-worker", "worker", "--max-output-tokens", "9"])
 
 
+def test_subcommands_and_legacy_gpu_invocation(capsys) -> None:
+    local = parse_command_args(["local", "--samples", "3"])
+    assert local.command == "local"
+    assert local.samples == 3
+
+    gpu_arguments = [
+        "--model",
+        "model",
+        "--tokenizer",
+        "tokenizer",
+        "--tokenizer-revision",
+        "revision",
+        "--vllm-revision",
+        "v0.22.0",
+        "--apc-worker",
+        "worker",
+        "--flume-url",
+        "http://flume",
+    ]
+    assert parse_command_args(["gpu", *gpu_arguments]).command == "gpu"
+    with pytest.warns(DeprecationWarning):
+        assert parse_command_args(gpu_arguments).command == "gpu"
+    assert "deprecated" in capsys.readouterr().err
+
+
 def test_main_writes_json_and_markdown(monkeypatch, tmp_path: Path, capsys) -> None:
     output = tmp_path / "nested" / "results.json"
-    args = SimpleNamespace(output=output)
+    args = SimpleNamespace(output=output, command="gpu")
     result = {
         "environment": {"commit": "abc"},
         "configuration": {
@@ -425,7 +536,7 @@ def test_main_writes_json_and_markdown(monkeypatch, tmp_path: Path, capsys) -> N
     async def fake_run(_: object) -> dict[str, object]:
         return result
 
-    monkeypatch.setattr(benchmark, "parse_args", lambda: args)
+    monkeypatch.setattr(benchmark, "parse_command_args", lambda _: args)
     monkeypatch.setattr(benchmark, "run_benchmark", fake_run)
 
     benchmark.main()

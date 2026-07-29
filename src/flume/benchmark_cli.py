@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import platform
 import random
 import subprocess
+import sys
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ import httpx
 
 class Tokenizer(Protocol):
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]: ...
+
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str: ...
 
 
 class Scenario(StrEnum):
@@ -41,6 +44,17 @@ class SamplePlan:
     prompt_token_ids: list[int]
     max_tokens: int
     cache_salt: str
+
+
+@dataclass(frozen=True, slots=True)
+class FlumeSamplePlan:
+    index: int
+    phase: str
+    flume_url: str
+    pack_id: str
+    tenant_id: str
+    prompt: str
+    max_tokens: int
 
 
 @dataclass(slots=True)
@@ -123,13 +137,6 @@ def unstable_prefix(
     return (unique + stable_prefix)[: len(stable_prefix)]
 
 
-def affinity_worker(workers: list[str], identity: str) -> str:
-    return max(
-        workers,
-        key=lambda worker: hashlib.sha256(f"{identity}\0{worker}".encode()).digest(),
-    )
-
-
 def choose_worker(
     scenario: Scenario,
     workers: list[str],
@@ -138,8 +145,7 @@ def choose_worker(
     affinity_identity: str,
     seed: int,
 ) -> str:
-    if scenario == Scenario.stable_warmed_prefix_affinity:
-        return affinity_worker(workers, affinity_identity)
+    del scenario, affinity_identity
     return random.Random(seed + index).choice(workers)
 
 
@@ -274,6 +280,150 @@ async def execute_plans(
     return samples, time.perf_counter() - started
 
 
+async def register_flume_pack(
+    client: httpx.AsyncClient,
+    *,
+    flume_url: str,
+    tenant_id: str,
+    tokenizer: Tokenizer,
+    context_length: int,
+) -> dict[str, Any]:
+    token_ids = exact_prefix_tokens(tokenizer, context_length)
+    try:
+        context = tokenizer.decode(token_ids, skip_special_tokens=True)
+    except (AttributeError, TypeError):
+        context = "".join(chr(token_id) for token_id in token_ids)
+    response = await client.post(
+        f"{flume_url.rstrip('/')}/v1/packs",
+        headers={"X-Flume-Tenant": tenant_id},
+        json={
+            "template_id": "gpu-benchmark-v1",
+            "chunks": [
+                {
+                    "doc_id": f"context-{context_length}",
+                    "chunk_id": "0",
+                    "version": "1",
+                    "text": context,
+                }
+            ],
+        },
+    )
+    response.raise_for_status()
+    return dict(response.json())
+
+
+async def warm_flume_pack(
+    client: httpx.AsyncClient,
+    *,
+    flume_url: str,
+    tenant_id: str,
+    pack_id: str,
+) -> dict[str, Any]:
+    response = await client.post(
+        f"{flume_url.rstrip('/')}/v1/packs/{pack_id}/warm",
+        headers={"X-Flume-Tenant": tenant_id},
+    )
+    response.raise_for_status()
+    return dict(response.json())
+
+
+async def execute_flume_sample(
+    client: httpx.AsyncClient,
+    plan: FlumeSamplePlan,
+) -> Sample:
+    started = time.perf_counter()
+    status_code: int | None = None
+    output_tokens: int | None = None
+    prompt_tokens = 0
+    worker_id = "unassigned"
+    error: str | None = None
+    ttft_at: float | None = None
+    try:
+        async with client.stream(
+            "POST",
+            f"{plan.flume_url.rstrip('/')}/v1/completions",
+            headers={"X-Flume-Tenant": plan.tenant_id},
+            json={
+                "pack_id": plan.pack_id,
+                "prompt": plan.prompt,
+                "max_tokens": plan.max_tokens,
+                "temperature": 0.0,
+                "stream": True,
+            },
+        ) as response:
+            status_code = response.status_code
+            worker_id = response.headers.get("X-Flume-Worker-Id", worker_id)
+            prompt_tokens = int(response.headers.get("X-Flume-Prompt-Tokens", 0))
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                now = time.perf_counter()
+                if ttft_at is None and line_has_token(line):
+                    ttft_at = now
+                if line.startswith("data:") and line.removeprefix("data:").strip() != "[DONE]":
+                    try:
+                        event = json.loads(line.removeprefix("data:").strip())
+                    except json.JSONDecodeError:
+                        continue
+                    usage = event.get("usage") or {}
+                    if usage.get("completion_tokens") is not None:
+                        output_tokens = int(usage["completion_tokens"])
+    except (httpx.HTTPError, ValueError) as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    ended = time.perf_counter()
+    return Sample(
+        index=plan.index,
+        phase=plan.phase,
+        worker_url=worker_id,
+        max_tokens=plan.max_tokens,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        ttft_ms=(ttft_at - started) * 1000 if ttft_at is not None else None,
+        e2e_ms=(ended - started) * 1000,
+        status_code=status_code,
+        error=error,
+    )
+
+
+async def execute_flume_plans(
+    client: httpx.AsyncClient,
+    plans: list[FlumeSamplePlan],
+    *,
+    concurrency: int,
+) -> tuple[list[Sample], float]:
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def bounded(plan: FlumeSamplePlan) -> Sample:
+        async with semaphore:
+            return await execute_flume_sample(client, plan)
+
+    started = time.perf_counter()
+    samples = await asyncio.gather(*(bounded(plan) for plan in plans))
+    return samples, time.perf_counter() - started
+
+
+def build_flume_plans(
+    *,
+    flume_url: str,
+    pack_id: str,
+    tenant_id: str,
+    phase: str,
+    samples: int,
+    max_output_tokens: int,
+) -> list[FlumeSamplePlan]:
+    return [
+        FlumeSamplePlan(
+            index=index,
+            phase=phase,
+            flume_url=flume_url,
+            pack_id=pack_id,
+            tenant_id=tenant_id,
+            prompt=f"Question {index % 17}: summarize the applicable rule.",
+            max_tokens=(index % max_output_tokens) + 1,
+        )
+        for index in range(samples)
+    ]
+
+
 def parse_prometheus(text: str) -> dict[str, float]:
     wanted = ("prefix_cache_queries", "prefix_cache_hits")
     totals: dict[str, float] = {}
@@ -383,6 +533,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "vllm_revision": args.vllm_revision,
             "apc_workers": args.apc_worker,
             "apc_disabled_workers": args.apc_disabled_worker,
+            "flume_url": args.flume_url,
             "context_lengths": args.context_length,
             "concurrency": args.concurrency,
             "discarded_warmups": args.warmups,
@@ -411,63 +562,128 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 for concurrency in args.concurrency:
                     cell = f"context_{context_length}/concurrency_{concurrency}"
                     before = await metrics_snapshot(client, workers) if args.collect_metrics else {}
-                    cold_plans = build_sample_plans(
-                        tokenizer=tokenizer,
-                        scenario=scenario,
-                        workers=workers,
-                        context_length=context_length,
-                        phase="cold",
-                        samples=args.cold_samples,
-                        max_output_tokens=args.max_output_tokens,
-                        run_salt=run_salt,
-                        seed=args.seed,
-                    )
-                    cold_samples, cold_duration = await execute_plans(
-                        client,
-                        cold_plans,
-                        model=args.model,
-                        concurrency=concurrency,
-                    )
-                    warmup_plans = build_sample_plans(
-                        tokenizer=tokenizer,
-                        scenario=scenario,
-                        workers=workers,
-                        context_length=context_length,
-                        phase="warmup",
-                        samples=args.warmups,
-                        max_output_tokens=args.max_output_tokens,
-                        run_salt=run_salt,
-                        seed=args.seed,
-                    )
-                    await execute_plans(
-                        client,
-                        warmup_plans,
-                        model=args.model,
-                        concurrency=concurrency,
-                    )
-                    warm_plans = build_sample_plans(
-                        tokenizer=tokenizer,
-                        scenario=scenario,
-                        workers=workers,
-                        context_length=context_length,
-                        phase="warm",
-                        samples=args.warm_samples,
-                        max_output_tokens=args.max_output_tokens,
-                        run_salt=run_salt,
-                        seed=args.seed,
-                    )
-                    warm_samples, warm_duration = await execute_plans(
-                        client,
-                        warm_plans,
-                        model=args.model,
-                        concurrency=concurrency,
-                    )
+                    registered_pack: dict[str, Any] | None = None
+                    warm_result: dict[str, Any] | None = None
+                    if scenario == Scenario.stable_warmed_prefix_affinity:
+                        registered_pack = await register_flume_pack(
+                            client,
+                            flume_url=args.flume_url,
+                            tenant_id=args.tenant,
+                            tokenizer=tokenizer,
+                            context_length=context_length,
+                        )
+                        pack_id = str(registered_pack["pack_id"])
+                        cold_samples, cold_duration = await execute_flume_plans(
+                            client,
+                            build_flume_plans(
+                                flume_url=args.flume_url,
+                                pack_id=pack_id,
+                                tenant_id=args.tenant,
+                                phase="cold",
+                                samples=args.cold_samples,
+                                max_output_tokens=args.max_output_tokens,
+                            ),
+                            concurrency=concurrency,
+                        )
+                        warm_result = await warm_flume_pack(
+                            client,
+                            flume_url=args.flume_url,
+                            tenant_id=args.tenant,
+                            pack_id=pack_id,
+                        )
+                        await execute_flume_plans(
+                            client,
+                            build_flume_plans(
+                                flume_url=args.flume_url,
+                                pack_id=pack_id,
+                                tenant_id=args.tenant,
+                                phase="warmup",
+                                samples=args.warmups,
+                                max_output_tokens=args.max_output_tokens,
+                            ),
+                            concurrency=concurrency,
+                        )
+                        warm_samples, warm_duration = await execute_flume_plans(
+                            client,
+                            build_flume_plans(
+                                flume_url=args.flume_url,
+                                pack_id=pack_id,
+                                tenant_id=args.tenant,
+                                phase="warm",
+                                samples=args.warm_samples,
+                                max_output_tokens=args.max_output_tokens,
+                            ),
+                            concurrency=concurrency,
+                        )
+                    else:
+                        cold_plans = build_sample_plans(
+                            tokenizer=tokenizer,
+                            scenario=scenario,
+                            workers=workers,
+                            context_length=context_length,
+                            phase="cold",
+                            samples=args.cold_samples,
+                            max_output_tokens=args.max_output_tokens,
+                            run_salt=run_salt,
+                            seed=args.seed,
+                        )
+                        cold_samples, cold_duration = await execute_plans(
+                            client,
+                            cold_plans,
+                            model=args.model,
+                            concurrency=concurrency,
+                        )
+                        warmup_plans = build_sample_plans(
+                            tokenizer=tokenizer,
+                            scenario=scenario,
+                            workers=workers,
+                            context_length=context_length,
+                            phase="warmup",
+                            samples=args.warmups,
+                            max_output_tokens=args.max_output_tokens,
+                            run_salt=run_salt,
+                            seed=args.seed,
+                        )
+                        await execute_plans(
+                            client,
+                            warmup_plans,
+                            model=args.model,
+                            concurrency=concurrency,
+                        )
+                        warm_plans = build_sample_plans(
+                            tokenizer=tokenizer,
+                            scenario=scenario,
+                            workers=workers,
+                            context_length=context_length,
+                            phase="warm",
+                            samples=args.warm_samples,
+                            max_output_tokens=args.max_output_tokens,
+                            run_salt=run_salt,
+                            seed=args.seed,
+                        )
+                        warm_samples, warm_duration = await execute_plans(
+                            client,
+                            warm_plans,
+                            model=args.model,
+                            concurrency=concurrency,
+                        )
                     after = await metrics_snapshot(client, workers) if args.collect_metrics else {}
                     scenario_results[cell] = {
-                        "context_prefix_tokens": context_length,
+                        "requested_context_tokens": context_length,
+                        "context_prefix_tokens": (
+                            registered_pack["token_count"]
+                            if registered_pack is not None
+                            else context_length
+                        ),
                         "cold": summarize_samples(cold_samples, cold_duration),
                         "warm": summarize_samples(warm_samples, warm_duration),
                         "discarded_warmups": args.warmups,
+                        "pack_id": (
+                            registered_pack["pack_id"]
+                            if registered_pack is not None
+                            else None
+                        ),
+                        "explicit_warmup": warm_result,
                         "vllm_metric_delta": metric_delta(before, after),
                     }
             result["results"][scenario] = scenario_results
@@ -509,14 +725,18 @@ def markdown_report(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+def add_gpu_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--tokenizer-revision", required=True)
     parser.add_argument("--vllm-revision", required=True)
     parser.add_argument("--apc-worker", action="append", default=[])
     parser.add_argument("--apc-disabled-worker", action="append", default=[])
+    parser.add_argument(
+        "--flume-url",
+        help="Flume API URL used by the stable warmed affinity scenario.",
+    )
+    parser.add_argument("--tenant", default="benchmark")
     parser.add_argument(
         "--scenario",
         action="append",
@@ -534,6 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collect-metrics", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-remote-tokenizer", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("benchmark-results.json"))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_gpu_arguments(parser)
     return parser
 
 
@@ -545,6 +770,13 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     args.concurrency = args.concurrency or [1, 8, 32]
     if not args.apc_worker and not args.apc_disabled_worker:
         parser.error("configure at least one --apc-worker or --apc-disabled-worker")
+    if (
+        Scenario.stable_warmed_prefix_affinity.value in args.scenario
+        and not args.flume_url
+    ):
+        parser.error(
+            "--flume-url is required for the stable_warmed_prefix_affinity scenario"
+        )
     positive = [
         *args.context_length,
         *args.concurrency,
@@ -559,13 +791,83 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    args = parse_args()
-    result = asyncio.run(run_benchmark(args))
+def build_command_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    local = subparsers.add_parser(
+        "local",
+        help="Run a CPU-only process-isolated Flume benchmark with two mock workers.",
+    )
+    local.add_argument("--samples", type=int, default=100)
+    local.add_argument("--warmups", type=int, default=10)
+    local.add_argument("--timeout", type=float, default=10.0)
+    local.add_argument("--startup-timeout", type=float, default=10.0)
+    local.add_argument("--output", type=Path, default=Path("benchmark-local.json"))
+    gpu = subparsers.add_parser("gpu", help="Run the external vLLM GPU benchmark.")
+    add_gpu_arguments(gpu)
+    return parser
+
+
+def parse_command_args(arguments: list[str] | None = None) -> argparse.Namespace:
+    arguments = list(sys.argv[1:] if arguments is None else arguments)
+    if arguments and arguments[0] in {"local", "gpu"}:
+        parser = build_command_parser()
+        args = parser.parse_args(arguments)
+        if args.command == "gpu":
+            gpu_args = parse_args(arguments[1:])
+            gpu_args.command = "gpu"
+            return gpu_args
+        if args.samples < 1 or args.warmups < 0:
+            parser.error("--samples must be positive and --warmups cannot be negative")
+        return args
+    warning = (
+        "flat flume-benchmark invocation is deprecated; use `flume-benchmark gpu ...`"
+    )
+    warnings.warn(warning, DeprecationWarning, stacklevel=2)
+    print(f"warning: {warning}", file=sys.stderr)
+    args = parse_args(arguments)
+    args.command = "gpu"
+    return args
+
+
+def local_markdown_report(result: dict[str, Any]) -> str:
+    config = result["configuration"]
+    measured = result["results"]["measured"]
+    errors = sum(sample["error"] is not None for sample in measured)
+    workers = sorted(
+        {
+            sample["worker_id"]
+            for sample in measured
+            if sample["worker_id"] is not None
+        }
+    )
+    return "\n".join(
+        [
+            "# Flume local benchmark",
+            "",
+            f"- Process-isolated mock workers: `{config['workers']}`",
+            f"- Measured requests: `{len(measured)}`",
+            f"- Errors: `{errors}`",
+            f"- Observed worker ids: `{', '.join(workers)}`",
+            "",
+        ]
+    )
+
+
+def main(arguments: list[str] | None = None) -> None:
+    args = parse_command_args(arguments)
+    if args.command == "local":
+        from flume.benchmark_local import run_local_benchmark
+
+        result = asyncio.run(run_local_benchmark(args))
+        report = local_markdown_report(result)
+    else:
+        result = asyncio.run(run_benchmark(args))
+        report = markdown_report(result)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     report_path = args.output.with_suffix(".md")
-    report_path.write_text(markdown_report(result), encoding="utf-8")
+    report_path.write_text(report, encoding="utf-8")
     print(f"wrote {args.output} and {report_path}")
 
 
