@@ -217,6 +217,64 @@ def test_hot_completion_avoids_store_and_health_and_logs_are_redacted(
     assert "sensitive-customer" not in logs
     assert "sensitive-customer" not in metrics
     assert "http://worker" not in metrics
+    assert 'flume_router_decisions_total{decision="primary",policy="hrw"}' in metrics
+    assert "flume_router_decision_duration_seconds_count" in metrics
+    assert 'flume_router_worker_load{source="local",worker_id="' in metrics
+
+
+def test_bounded_routing_refreshes_load_only_in_background(tmp_path) -> None:
+    metrics_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal metrics_calls
+        if request.url.path == "/health":
+            return httpx.Response(200)
+        if request.url.path == "/metrics":
+            metrics_calls += 1
+            return httpx.Response(
+                200,
+                text=(
+                    "vllm:num_requests_running 0\n"
+                    "vllm:num_requests_waiting 0\n"
+                ),
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"text": "answer", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 1},
+            },
+        )
+
+    tokenizer = DeterministicByteTokenizer(tokenizer_id="tokenizer", revision="byte-v1")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'flume.db'}",
+            vllm_workers=["http://worker-a", "http://worker-b"],
+            model_id="model",
+            tokenizer_id="tokenizer",
+            tokenizer_revision="byte-v1",
+            cache_salt_secret="test-secret-that-is-at-least-thirty-two-bytes",
+            health_refresh_seconds=60,
+            routing_policy="bounded_hrw",
+            worker_load_refresh_ms=60_000,
+            worker_load_stale_ms=60_000,
+        ),
+        compiler=ContextPackCompiler(tokenizer, model_id="model"),
+        vllm_transport=httpx.MockTransport(handler),
+    )
+    with TestClient(app) as client:
+        pack = register_pack(client)
+        startup_metrics_calls = metrics_calls
+        response = client.post(
+            "/v1/completions",
+            headers={"X-Flume-Tenant": "demo"},
+            json={"pack_id": pack["pack_id"], "prompt": "question"},
+        )
+
+    assert response.status_code == 200
+    assert startup_metrics_calls == 2
+    assert metrics_calls == startup_metrics_calls
 
 
 def test_warm_and_stats_expose_only_safe_worker_ids(tmp_path) -> None:
@@ -235,8 +293,13 @@ def test_warm_and_stats_expose_only_safe_worker_ids(tmp_path) -> None:
     assert "worker_url" not in warmed.json()
     assert "http://" not in warmed.text
     assert stats.status_code == 200
-    assert stats.json()["workers"][0]["worker_id"]
-    assert "worker_url" not in stats.json()["workers"][0]
+    worker_stats = stats.json()["workers"][0]
+    assert worker_stats["worker_id"]
+    assert worker_stats["affinity_misses"] == 1
+    assert worker_stats["affinity_hits"] == 0
+    assert worker_stats["local_in_flight"] == 0
+    assert worker_stats["capacity_weight"] == 1.0
+    assert "worker_url" not in worker_stats
     assert "http://" not in stats.text
 
 

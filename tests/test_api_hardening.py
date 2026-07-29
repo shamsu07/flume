@@ -9,12 +9,19 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from flume.api import AdmissionController, _stream_with_release, create_app
+from flume.api import (
+    AdmissionController,
+    _complete_with_failover,
+    _open_stream_with_failover,
+    _stream_with_release,
+    create_app,
+)
 from flume.compiler import ContextPackCompiler, DeterministicByteTokenizer
 from flume.config import INSECURE_CACHE_SALT_SECRET, Settings
-from flume.router import PackRouter
+from flume.models import CompletionRequest
+from flume.router import NoHealthyWorkers, PackRouter
 from flume.store import PackConflictError
-from flume.vllm import VLLMStream
+from flume.vllm import VLLMClient, VLLMStream
 
 SECRET = "test-secret-that-is-at-least-thirty-two-bytes"
 
@@ -84,6 +91,63 @@ def register_pack(client: TestClient, tenant: str = "demo") -> dict[str, Any]:
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+async def run_lifespan(app: Any) -> None:
+    async with app.router.lifespan_context(app):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_lifespan_initialization_cancellation_closes_resources_once(
+    tmp_path: Any,
+) -> None:
+    router_starting = asyncio.Event()
+
+    async def blocked_router_start() -> None:
+        router_starting.set()
+        await asyncio.Event().wait()
+
+    app = build_app(tmp_path)
+    app.state.store.init_schema = AsyncMock()
+    app.state.vllm.start = AsyncMock()
+    app.state.router.start = AsyncMock(side_effect=blocked_router_start)
+    app.state.router.close = AsyncMock()
+    app.state.vllm.close = AsyncMock()
+    app.state.store.close = AsyncMock()
+    task = asyncio.create_task(run_lifespan(app))
+    await router_starting.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    app.state.router.close.assert_awaited_once_with()
+    app.state.vllm.close.assert_awaited_once_with()
+    app.state.store.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_initialization_base_exception_closes_resources_once(
+    tmp_path: Any,
+) -> None:
+    class StartupAbort(BaseException):
+        pass
+
+    app = build_app(tmp_path)
+    app.state.store.init_schema = AsyncMock()
+    app.state.vllm.start = AsyncMock()
+    app.state.router.start = AsyncMock(side_effect=StartupAbort)
+    app.state.router.close = AsyncMock()
+    app.state.vllm.close = AsyncMock()
+    app.state.store.close = AsyncMock()
+
+    with pytest.raises(StartupAbort):
+        await run_lifespan(app)
+
+    app.state.router.close.assert_awaited_once_with()
+    app.state.vllm.close.assert_awaited_once_with()
+    app.state.store.close.assert_awaited_once_with()
 
 
 def test_readiness_reports_all_failed_dependencies(tmp_path: Any, monkeypatch: Any) -> None:
@@ -428,12 +492,12 @@ async def test_never_iterated_stream_releases_accounting_once() -> None:
 @pytest.mark.asyncio
 async def test_never_iterated_upstream_stream_releases_worker_lease_once() -> None:
     router = PackRouter(["http://worker"])
-    router.acquire("http://worker")
+    lease = router.acquire("http://worker")
     response = httpx.Response(200, stream=FragmentedStream([b"data: [DONE]\n\n"]))
     stream = VLLMStream(
         response,
         started=time.perf_counter(),
-        on_done=lambda _: router.release("http://worker"),
+        on_done=lambda _: lease.release(),
     )
     admission = AdmissionController(1)
     assert admission.acquire()
@@ -444,6 +508,114 @@ async def test_never_iterated_upstream_stream_releases_worker_lease_once() -> No
 
     assert router.local_in_flight("http://worker") == 0
     assert admission.current == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_header_cancellation_releases_initial_worker_lease() -> None:
+    headers_started = asyncio.Event()
+
+    async def blocked(_: httpx.Request) -> httpx.Response:
+        headers_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    router = PackRouter(["http://worker"])
+    vllm = VLLMClient(transport=httpx.MockTransport(blocked))
+    await vllm.start()
+    task = asyncio.create_task(
+        _open_stream_with_failover(
+            router=router,
+            vllm=vllm,
+            worker_url="http://worker",
+            pack_id="pack",
+            model="model",
+            prompt=[1],
+            request=CompletionRequest(pack_id="pack", prompt="question", stream=True),
+            cache_salt="salt",
+        )
+    )
+    await headers_started.wait()
+    assert router.local_in_flight("http://worker") == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert router.local_in_flight("http://worker") == 0
+    await vllm.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_header_cancellation_releases_replacement_worker_lease() -> None:
+    replacement_started = asyncio.Event()
+    calls = 0
+
+    async def fail_then_block(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("unavailable", request=request)
+        replacement_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    workers = ["http://worker-a", "http://worker-b"]
+    router = PackRouter(workers)
+    vllm = VLLMClient(transport=httpx.MockTransport(fail_then_block))
+    await vllm.start()
+    task = asyncio.create_task(
+        _open_stream_with_failover(
+            router=router,
+            vllm=vllm,
+            worker_url=workers[0],
+            pack_id="pack",
+            model="model",
+            prompt=[1],
+            request=CompletionRequest(pack_id="pack", prompt="question", stream=True),
+            cache_salt="salt",
+        )
+    )
+    await replacement_started.wait()
+    assert router.local_in_flight(workers[0]) == 0
+    assert router.local_in_flight(workers[1]) == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert router.local_in_flight(workers[0]) == 0
+    assert router.local_in_flight(workers[1]) == 0
+    await vllm.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_failover_does_not_release_another_request_lease() -> None:
+    async def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unavailable", request=request)
+
+    router = PackRouter(["http://worker"])
+    router.acquire("http://worker")
+    vllm = VLLMClient(transport=httpx.MockTransport(unavailable))
+    await vllm.start()
+
+    with pytest.raises(NoHealthyWorkers):
+        await _complete_with_failover(
+            router=router,
+            vllm=vllm,
+            worker_url="http://worker",
+            pack_id="pack",
+            model="model",
+            prompt=[1],
+            max_tokens=1,
+            temperature=0,
+            top_p=1,
+            stop=None,
+            extra_body=None,
+            cache_salt="salt",
+        )
+
+    assert router.local_in_flight("http://worker") == 1
+    await vllm.close()
 
 
 def test_overload_and_metrics_disabled_paths(tmp_path: Any, monkeypatch: Any) -> None:

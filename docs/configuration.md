@@ -9,7 +9,7 @@ deployment secret manager, not an image or Compose file.
 | `FLUME_TOKENIZER_ID` | yes | Tokenizer repository or local path. |
 | `FLUME_TOKENIZER_REVISION` | yes | Immutable tokenizer commit revision. |
 | `FLUME_CACHE_SALT_SECRET` | yes | High-entropy secret used to derive tenant cache salts. |
-| `FLUME_VLLM_WORKERS` | yes | Comma-separated homogeneous worker base URLs. |
+| `FLUME_VLLM_WORKERS` | yes | Comma-separated or JSON-array homogeneous worker base URLs. |
 | `FLUME_DATABASE_URL` | yes | Single-instance SQLite URL under a persistent volume. |
 | `FLUME_REQUEST_TIMEOUT_SECONDS` | no | Upstream request timeout. |
 | `FLUME_CONNECT_TIMEOUT_SECONDS` | no | Upstream connection timeout. |

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import (
     Field,
@@ -12,7 +13,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 INSECURE_CACHE_SALT_SECRET = "development-only-change-before-production"
 
@@ -25,7 +26,9 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8080
     database_url: str = "sqlite:///./flume.db"
-    vllm_workers: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
+    vllm_workers: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:8000"]
+    )
     model_id: str = "local-model"
     tokenizer_id: str = "local-tokenizer"
     tokenizer_revision: str = "0000000000000000000000000000000000000000"
@@ -59,10 +62,20 @@ class Settings(BaseSettings):
     @classmethod
     def parse_workers(cls, value: object) -> list[str]:
         if isinstance(value, str):
-            return [item.strip().rstrip("/") for item in value.split(",") if item.strip()]
+            stripped = value.strip()
+            if stripped.startswith("["):
+                try:
+                    value = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("vllm_workers contains invalid JSON") from exc
+            else:
+                value = [item for item in stripped.split(",") if item.strip()]
         if isinstance(value, list):
-            return [str(item).rstrip("/") for item in value]
-        raise TypeError("vllm_workers must be a comma-separated string or list")
+            normalized = [str(item).strip().rstrip("/") for item in value]
+            if not normalized or any(not item for item in normalized):
+                raise ValueError("vllm_workers must contain at least one non-empty URL")
+            return normalized
+        raise TypeError("vllm_workers must be a comma-separated string or JSON array")
 
     @field_validator("cache_salt_secret")
     @classmethod

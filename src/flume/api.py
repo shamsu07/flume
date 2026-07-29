@@ -45,7 +45,7 @@ from flume.models import (
     WarmResponse,
     WorkerStats,
 )
-from flume.router import NoHealthyWorkers, PackRouter, WarmupSingleFlight
+from flume.router import NoHealthyWorkers, PackRouter, WarmupSingleFlight, WorkerLease
 from flume.store import ByteBoundedPackCache, FlumeStore, PackConflictError
 from flume.vllm import (
     CompletionResult,
@@ -161,26 +161,30 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await store.init_schema()
-        await vllm.start()
-        app.state.compiler_error = None
-        if app.state.compiler is None:
-            try:
-                app.state.compiler = ContextPackCompiler.from_pretrained(
-                    tokenizer_id=settings.tokenizer_id,
-                    tokenizer_revision=settings.tokenizer_revision,
-                    model_id=settings.model_id,
-                    allow_remote_tokenizer=settings.allow_remote_tokenizer,
-                )
-            except Exception:
-                app.state.compiler_error = "configured tokenizer could not be loaded"
-        await router.start()
         try:
+            await store.init_schema()
+            await vllm.start()
+            app.state.compiler_error = None
+            if app.state.compiler is None:
+                try:
+                    app.state.compiler = ContextPackCompiler.from_pretrained(
+                        tokenizer_id=settings.tokenizer_id,
+                        tokenizer_revision=settings.tokenizer_revision,
+                        model_id=settings.model_id,
+                        allow_remote_tokenizer=settings.allow_remote_tokenizer,
+                    )
+                except Exception:
+                    app.state.compiler_error = "configured tokenizer could not be loaded"
+            await router.start()
             yield
         finally:
-            await router.close()
-            await vllm.close()
-            await store.close()
+            try:
+                await router.close()
+            finally:
+                try:
+                    await vllm.close()
+                finally:
+                    await store.close()
 
     app = FastAPI(
         title="Flume",
@@ -392,14 +396,15 @@ def create_app(
                 )
                 metric_worker = _worker_id(actual_worker)
                 headers["X-Flume-Worker-Id"] = metric_worker
-                stream_handed_off = True
                 managed_stream = _stream_with_release(stream, admission, actual_worker)
-                return StreamingResponse(
+                response = StreamingResponse(
                     managed_stream,
                     media_type="text/event-stream",
                     headers=headers,
                     background=BackgroundTask(managed_stream.aclose),
                 )
+                stream_handed_off = True
+                return response
 
             started = time.perf_counter()
             result, actual_worker = await _complete_with_failover(
@@ -466,17 +471,20 @@ def create_app(
         health = router.health()
         workers = []
         for worker in settings.vllm_workers:
-            counts = route_counts.get(
-                worker,
-                {"assigned_packs": 0, "affinity_hits": 0, "affinity_misses": 0},
-            )
+            counts = route_counts[worker]
             workers.append(
                 WorkerStats(
                     worker_id=_worker_id(worker),
                     healthy=health.get(worker),
-                    assigned_packs=counts["assigned_packs"],
-                    affinity_hits=counts["affinity_hits"],
-                    affinity_misses=counts["affinity_misses"],
+                    assigned_packs=counts.assigned_packs,
+                    affinity_hits=counts.affinity_hits,
+                    affinity_misses=counts.affinity_misses,
+                    local_in_flight=counts.local_in_flight,
+                    upstream_running=counts.upstream_running,
+                    upstream_waiting=counts.upstream_waiting,
+                    effective_load=counts.effective_load,
+                    load_fresh=counts.load_fresh,
+                    capacity_weight=counts.capacity_weight,
                 )
             )
         return StatsResponse(packs=pack_count, routes=route_count, workers=workers)
@@ -547,12 +555,11 @@ async def _complete_with_failover(
     extra_body: dict[str, Any] | None,
     cache_salt: str,
 ) -> tuple[CompletionResult, str]:
-    active_worker = worker_url
-    router.acquire(active_worker)
-    try:
+    async def complete(target_worker: str) -> CompletionResult:
+        lease = router.acquire(target_worker)
         try:
-            result = await vllm.complete(
-                worker_url=active_worker,
+            return await vllm.complete(
+                worker_url=target_worker,
                 model=model,
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -562,28 +569,16 @@ async def _complete_with_failover(
                 extra_body=extra_body,
                 cache_salt=cache_salt,
             )
-            return result, active_worker
-        except VLLMConnectionError:
-            ROUTER_FAILOVERS.labels(operation="completion").inc()
-            router.mark_unhealthy(active_worker)
-            router.release(active_worker)
-            replacement = await router.choose(pack_id, exclude={active_worker})
-            active_worker = replacement
-            router.acquire(active_worker)
-            result = await vllm.complete(
-                worker_url=active_worker,
-                model=model,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                extra_body=extra_body,
-                cache_salt=cache_salt,
-            )
-            return result, active_worker
-    finally:
-        router.release(active_worker)
+        finally:
+            lease.release()
+
+    try:
+        return await complete(worker_url), worker_url
+    except VLLMConnectionError:
+        ROUTER_FAILOVERS.labels(operation="completion").inc()
+        router.mark_unhealthy(worker_url)
+        replacement = await router.choose(pack_id, exclude={worker_url})
+        return await complete(replacement), replacement
 
 
 async def _open_stream_with_failover(
@@ -598,46 +593,39 @@ async def _open_stream_with_failover(
     cache_salt: str,
 ) -> tuple[VLLMStream, str]:
     async def open_stream(target_worker: str) -> VLLMStream:
-        return await vllm.open_stream_completion(
-            worker_url=target_worker,
-            model=model,
-            prompt=prompt,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            stop=request.stop,
-            extra_body=request.extra_body,
-            cache_salt=cache_salt,
-            on_first_token=lambda value: TTFT.observe(value / 1000),
-            on_done=lambda value: _finish_worker_stream(router, target_worker, value),
-        )
+        lease = router.acquire(target_worker)
+        try:
+            return await vllm.open_stream_completion(
+                worker_url=target_worker,
+                model=model,
+                prompt=prompt,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=request.stop,
+                extra_body=request.extra_body,
+                cache_salt=cache_salt,
+                on_first_token=lambda value: TTFT.observe(value / 1000),
+                on_done=lambda value: _finish_worker_stream(lease, value),
+            )
+        except BaseException:
+            lease.release()
+            raise
 
-    active_worker = worker_url
-    router.acquire(active_worker)
     try:
-        stream = await open_stream(active_worker)
-        return stream, active_worker
+        stream = await open_stream(worker_url)
+        return stream, worker_url
     except VLLMConnectionError:
         ROUTER_FAILOVERS.labels(operation="stream").inc()
-        router.mark_unhealthy(active_worker)
-        router.release(active_worker)
-        replacement = await router.choose(pack_id, exclude={active_worker})
-        active_worker = replacement
-        router.acquire(active_worker)
-        try:
-            stream = await open_stream(active_worker)
-            return stream, active_worker
-        except Exception:
-            router.release(active_worker)
-            raise
-    except Exception:
-        router.release(active_worker)
-        raise
+        router.mark_unhealthy(worker_url)
+        replacement = await router.choose(pack_id, exclude={worker_url})
+        stream = await open_stream(replacement)
+        return stream, replacement
 
 
-def _finish_worker_stream(router: PackRouter, worker_url: str, latency_ms: float) -> None:
+def _finish_worker_stream(lease: WorkerLease, latency_ms: float) -> None:
     ASK_LATENCY.observe(latency_ms / 1000)
-    router.release(worker_url)
+    lease.release()
 
 
 def _stream_with_release(
