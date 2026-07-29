@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from flume.compiler import ContextPackCompiler
+from flume.hashing import canonical_identifier, canonical_text, sha256_text
 from flume.models import (
     AskRequest,
     BenchmarkRun,
@@ -38,19 +40,31 @@ def compile_pack(
     )
 
 
-def chunks_from_files(paths: list[Path]) -> list[DocumentChunk]:
-    chunks = []
-    for index, path in enumerate(paths):
+def chunks_from_files(
+    paths: list[Path],
+    *,
+    logical_names: Mapping[Path, str] | None = None,
+) -> list[DocumentChunk]:
+    """Create path-independent chunks using stable logical names and content versions."""
+    chunks: list[DocumentChunk] = []
+    seen_names: set[str] = set()
+    logical_names = logical_names or {}
+    for path in paths:
+        logical_name = canonical_identifier(logical_names.get(path, path.name))
+        if logical_name in seen_names:
+            raise ValueError(f"duplicate logical file name: {logical_name}")
+        seen_names.add(logical_name)
+        text = canonical_text(path.read_text(encoding="utf-8"))
         chunks.append(
             DocumentChunk(
-                doc_id=path.stem,
-                chunk_id=str(index),
-                version=str(int(path.stat().st_mtime)),
-                text=path.read_text(encoding="utf-8"),
-                metadata={"path": str(path)},
+                doc_id=logical_name,
+                chunk_id="0",
+                version=sha256_text(text),
+                text=text,
+                metadata={"source_name": logical_name},
             )
         )
-    return chunks
+    return sorted(chunks, key=lambda chunk: (chunk.doc_id, chunk.chunk_id, chunk.version))
 
 
 class FlumeClient:

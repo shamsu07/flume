@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import re
-import unicodedata
 from dataclasses import dataclass
 from typing import Protocol
 
-from flume.hashing import canonical_json, sha256_json, sha256_text, sha256_token_ids
+from flume.hashing import (
+    canonical_json,
+    canonical_text,
+    sha256_json,
+    sha256_text,
+    sha256_token_ids,
+)
 from flume.models import ContextPack, DocumentChunk, OrderPolicy, PackCreateRequest
+
+COMPILER_FORMAT_VERSION = "1"
 
 DEFAULT_TEMPLATE = """You are answering using a cache-stable RAG context pack.
 
@@ -64,7 +70,7 @@ class ContextPackCompiler:
     def compile(self, request: PackCreateRequest) -> ContextPack:
         ordered_chunks = self._order_chunks(request.chunks, request.order_policy)
         context = self._render_context(ordered_chunks)
-        template = request.template or DEFAULT_TEMPLATE
+        template = canonical_text(request.template or DEFAULT_TEMPLATE)
         compiled_prefix = template.format(context=context)
 
         tokenizer = load_tokenizer(request.tokenizer_id, self.allow_remote_tokenizer)
@@ -72,29 +78,35 @@ class ContextPackCompiler:
 
         document_hash = sha256_json(
             {
-                "tenant_id": request.tenant_id,
-                "template_id": request.template_id,
-                "order_policy": request.order_policy.value,
+                "compiler_format_version": COMPILER_FORMAT_VERSION,
                 "chunks": [chunk.model_dump(mode="json") for chunk in ordered_chunks],
             }
         )
+        template_digest = sha256_text(template)
+        canonical_prefix_hash = sha256_text(compiled_prefix)
         token_hash = sha256_token_ids(token_ids)
         pack_id = self._pack_id(
             tenant_id=request.tenant_id,
             model_id=request.model_id,
             tokenizer_id=request.tokenizer_id,
             template_id=request.template_id,
+            template_digest=template_digest,
+            order_policy=request.order_policy,
             document_hash=document_hash,
+            canonical_prefix_hash=canonical_prefix_hash,
             token_hash=token_hash,
         )
 
         return ContextPack(
             pack_id=pack_id,
+            compiler_format_version=COMPILER_FORMAT_VERSION,
             tenant_id=request.tenant_id,
             model_id=request.model_id,
             tokenizer_id=request.tokenizer_id,
             template_id=request.template_id,
+            template_digest=template_digest,
             document_hash=document_hash,
+            canonical_prefix_hash=canonical_prefix_hash,
             token_hash=token_hash,
             token_count=len(token_ids),
             compiled_prefix=compiled_prefix,
@@ -123,27 +135,23 @@ class ContextPackCompiler:
             metadata = ""
             if chunk.metadata:
                 metadata = f"\nmetadata: {canonical_json(chunk.metadata)}"
+            doc_id = canonical_json(chunk.doc_id)
+            chunk_id = canonical_json(chunk.chunk_id)
+            version = canonical_json(chunk.version)
             rendered.append(
                 "\n".join(
                     [
                         (
-                            f"<chunk doc_id={chunk.doc_id!r} "
-                            f"chunk_id={chunk.chunk_id!r} "
-                            f"version={chunk.version!r}>"
+                            f"<chunk doc_id={doc_id} "
+                            f"chunk_id={chunk_id} "
+                            f"version={version}>"
                         ),
-                        self._normalize_text(chunk.text),
+                        canonical_text(chunk.text),
                         f"</chunk>{metadata}",
                     ]
                 )
             )
         return "\n\n---\n\n".join(rendered)
-
-    def _normalize_text(self, text: str) -> str:
-        normalized = unicodedata.normalize("NFKC", text)
-        normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
-        normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
-        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-        return normalized.strip()
 
     def _pack_id(
         self,
@@ -152,17 +160,24 @@ class ContextPackCompiler:
         model_id: str,
         tokenizer_id: str,
         template_id: str,
+        template_digest: str,
+        order_policy: OrderPolicy,
         document_hash: str,
+        canonical_prefix_hash: str,
         token_hash: str,
     ) -> str:
         digest = sha256_text(
             canonical_json(
                 {
+                    "compiler_format_version": COMPILER_FORMAT_VERSION,
                     "tenant_id": tenant_id,
                     "model_id": model_id,
                     "tokenizer_id": tokenizer_id,
                     "template_id": template_id,
+                    "template_digest": template_digest,
+                    "order_policy": order_policy.value,
                     "document_hash": document_hash,
+                    "canonical_prefix_hash": canonical_prefix_hash,
                     "token_hash": token_hash,
                 }
             )

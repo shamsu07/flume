@@ -112,11 +112,14 @@ class PackCreateRequest(BaseModel):
 
 class ContextPack(BaseModel):
     pack_id: str
+    compiler_format_version: str
     tenant_id: str
     model_id: str
     tokenizer_id: str
     template_id: str
+    template_digest: str
     document_hash: str
+    canonical_prefix_hash: str
     token_hash: str
     token_count: int
     compiled_prefix: str
@@ -126,7 +129,7 @@ class ContextPack(BaseModel):
     tags: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    model_config = ConfigDict(use_enum_values=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
 
     @property
     def expired(self) -> bool:
@@ -134,6 +137,46 @@ class ContextPack(BaseModel):
             return False
         age = (utc_now() - self.created_at).total_seconds()
         return age > self.ttl_seconds
+
+    def to_summary(self) -> PackSummary:
+        return PackSummary(
+            pack_id=self.pack_id,
+            compiler_format_version=self.compiler_format_version,
+            model_id=self.model_id,
+            tokenizer_id=self.tokenizer_id,
+            template_id=self.template_id,
+            document_hash=self.document_hash,
+            canonical_prefix_hash=self.canonical_prefix_hash,
+            token_count=self.token_count,
+            created_at=self.created_at,
+            ttl_seconds=self.ttl_seconds,
+            tags=self.tags,
+        )
+
+
+class PackSummary(BaseModel):
+    """Safe public representation which never contains prefix text or token ids."""
+
+    pack_id: str
+    compiler_format_version: str
+    model_id: str
+    tokenizer_id: str
+    template_id: str
+    document_hash: str
+    canonical_prefix_hash: str
+    token_count: int
+    created_at: datetime
+    ttl_seconds: int | None = None
+    tags: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(frozen=True)
+
+
+class PackPage(BaseModel):
+    items: list[PackSummary]
+    next_cursor: str | None = None
+
+    model_config = ConfigDict(frozen=True)
 
 
 class AskRequest(BaseModel):
