@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Annotated
 
@@ -10,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from flume.config import Settings
-from flume.models import PackCreateRequest
+from flume.models import CompletionRequest, PackRegistrationRequest
 from flume.sdk import FlumeClient, chunks_from_files
 
 app = typer.Typer(help="Flume RAG cache compiler and vLLM proxy.")
@@ -59,39 +58,34 @@ def create_pack(
         typer.Argument(help="Text files to compile into the context pack."),
     ],
     tenant: Annotated[str, typer.Option(help="Tenant id.")] = "default",
-    model: Annotated[str, typer.Option(help="Model id.")] = "local-model",
-    tokenizer: Annotated[str, typer.Option(help="Tokenizer id.")] = "local-tokenizer",
     template_id: Annotated[str, typer.Option(help="Template id.")] = "default-rag-v1",
     api: Annotated[str, typer.Option(help="Flume API URL.")] = "http://localhost:8080",
 ) -> None:
     chunks = chunks_from_files(files)
-    request = PackCreateRequest(
-        tenant_id=tenant,
-        model_id=model,
-        tokenizer_id=tokenizer,
+    request = PackRegistrationRequest(
         template_id=template_id,
         chunks=chunks,
     )
-    pack = FlumeClient(api).register_pack(request)
+    with FlumeClient(api, tenant_id=tenant) as client:
+        pack = client.register_pack(request)
     console.print(pack.model_dump_json(indent=2))
 
 
 @pack_app.command("list")
 def list_packs(
-    tenant: Annotated[str | None, typer.Option(help="Optional tenant id filter.")] = None,
+    tenant: Annotated[str, typer.Option(help="Tenant id.")] = "default",
     api: Annotated[str, typer.Option(help="Flume API URL.")] = "http://localhost:8080",
 ) -> None:
-    packs = FlumeClient(api).list_packs(tenant_id=tenant)
+    with FlumeClient(api, tenant_id=tenant) as client:
+        page = client.list_packs()
     table = Table(title="Context Packs")
     table.add_column("pack_id")
-    table.add_column("tenant")
     table.add_column("model")
     table.add_column("tokens", justify="right")
     table.add_column("created_at")
-    for pack in packs:
+    for pack in page.items:
         table.add_row(
             pack.pack_id,
-            pack.tenant_id,
             pack.model_id,
             str(pack.token_count),
             str(pack.created_at),
@@ -102,29 +96,37 @@ def list_packs(
 @app.command()
 def warm(
     pack_id: str,
+    tenant: Annotated[str, typer.Option(help="Tenant id.")] = "default",
     api: Annotated[str, typer.Option(help="Flume API URL.")] = "http://localhost:8080",
 ) -> None:
-    response = FlumeClient(api).warm_pack(pack_id)
+    with FlumeClient(api, tenant_id=tenant) as client:
+        response = client.warm_pack(pack_id)
     console.print(response.model_dump_json(indent=2))
 
 
 @app.command()
 def ask(
     pack_id: str,
-    question: str,
+    prompt: str,
+    tenant: Annotated[str, typer.Option(help="Tenant id.")] = "default",
     api: Annotated[str, typer.Option(help="Flume API URL.")] = "http://localhost:8080",
     max_tokens: Annotated[int, typer.Option(help="Generation max tokens.")] = 256,
 ) -> None:
-    response = FlumeClient(api).ask(pack_id, question, max_tokens=max_tokens)
-    console.print(response.get("text", ""))
-    console.print_json(json.dumps(response))
+    with FlumeClient(api, tenant_id=tenant) as client:
+        response = client.complete(
+            CompletionRequest(pack_id=pack_id, prompt=prompt, max_tokens=max_tokens)
+        )
+    console.print(response.choices[0].text if response.choices else "")
+    console.print(response.model_dump_json(indent=2))
 
 
 @app.command()
 def stats(
+    tenant: Annotated[str, typer.Option(help="Tenant id.")] = "default",
     api: Annotated[str, typer.Option(help="Flume API URL.")] = "http://localhost:8080",
 ) -> None:
-    response = FlumeClient(api).cache_stats()
+    with FlumeClient(api, tenant_id=tenant) as client:
+        response = client.stats()
     console.print(response.model_dump_json(indent=2))
 
 

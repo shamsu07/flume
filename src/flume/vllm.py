@@ -62,6 +62,7 @@ class VLLMStream:
         self.on_done = on_done
         self._first_token_seen = False
         self._buffer = b""
+        self._event_data: list[str] = []
         self._closed = False
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -76,23 +77,42 @@ class VLLMStream:
         if self._first_token_seen:
             return
         self._buffer += chunk
-        frames = self._buffer.split(b"\n\n")
-        self._buffer = frames.pop()
-        for frame in frames:
-            for line in frame.splitlines():
-                if VLLMClient.line_has_token(line.decode("utf-8", errors="replace")):
-                    self._first_token_seen = True
-                    if self.on_first_token is not None:
-                        self.on_first_token((time.perf_counter() - self.started) * 1000)
-                    return
+        while b"\n" in self._buffer:
+            raw_line, self._buffer = self._buffer.split(b"\n", 1)
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            self._inspect_line(raw_line.decode("utf-8", errors="replace"))
+            if self._first_token_seen:
+                self._buffer = b""
+                return
+
+    def _inspect_line(self, line: str) -> None:
+        if not line:
+            data = "\n".join(self._event_data)
+            self._event_data.clear()
+            if VLLMClient.data_has_token(data):
+                self._first_token_seen = True
+                if self.on_first_token is not None:
+                    self.on_first_token((time.perf_counter() - self.started) * 1000)
+            return
+        if line.startswith(":"):
+            return
+        field, separator, value = line.partition(":")
+        if field != "data":
+            return
+        if separator and value.startswith(" "):
+            value = value[1:]
+        self._event_data.append(value)
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        await self.response.aclose()
-        if self.on_done is not None:
-            self.on_done((time.perf_counter() - self.started) * 1000)
+        try:
+            await self.response.aclose()
+        finally:
+            if self.on_done is not None:
+                self.on_done((time.perf_counter() - self.started) * 1000)
 
 
 class VLLMClient:
@@ -148,7 +168,7 @@ class VLLMClient:
         max_tokens: int,
         temperature: float,
         top_p: float = 1.0,
-        stop: list[str] | None = None,
+        stop: str | list[str] | None = None,
         cache_salt: str | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> CompletionResult:
@@ -164,19 +184,13 @@ class VLLMClient:
             extra_body=extra_body,
         )
         started = time.perf_counter()
-        response: httpx.Response | None = None
-        for attempt in range(2):
-            try:
-                response = await self.client.post(
-                    f"{worker_url.rstrip('/')}/v1/completions",
-                    json=payload,
-                )
-                break
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-                if attempt == 1:
-                    raise VLLMConnectionError("could not connect to vLLM") from exc
-        if response is None:
-            raise VLLMConnectionError("could not connect to vLLM")
+        try:
+            response = await self.client.post(
+                f"{worker_url.rstrip('/')}/v1/completions",
+                json=payload,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise VLLMConnectionError("could not connect to vLLM") from exc
         if response.is_error:
             raise VLLMUpstreamError(response.status_code)
         try:
@@ -205,7 +219,7 @@ class VLLMClient:
         max_tokens: int,
         temperature: float,
         top_p: float = 1.0,
-        stop: list[str] | None = None,
+        stop: str | list[str] | None = None,
         cache_salt: str | None = None,
         extra_body: dict[str, Any] | None = None,
         on_first_token: Callable[[float], None] | None = None,
@@ -257,7 +271,7 @@ class VLLMClient:
         max_tokens: int,
         temperature: float,
         top_p: float,
-        stop: list[str] | None,
+        stop: str | list[str] | None,
         stream: bool,
         cache_salt: str | None,
         extra_body: dict[str, Any] | None,
@@ -284,8 +298,14 @@ class VLLMClient:
     @staticmethod
     def line_has_token(line: str) -> bool:
         if not line.startswith("data:"):
-            return bool(line.strip())
+            return False
         data = line.removeprefix("data:").strip()
+        return VLLMClient.data_has_token(data)
+
+    @staticmethod
+    def data_has_token(data: str) -> bool:
+        if not data:
+            return False
         if data == "[DONE]":
             return False
         try:

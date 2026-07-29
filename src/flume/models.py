@@ -54,10 +54,9 @@ class DocumentChunk(BaseModel):
         return normalized
 
 
-class PackCreateRequest(BaseModel):
-    tenant_id: str = Field(default="default", min_length=1, max_length=128)
-    model_id: str = Field(min_length=1, max_length=512)
-    tokenizer_id: str = Field(min_length=1, max_length=512)
+class PackRegistrationRequest(BaseModel):
+    """Public pack input. Runtime identity is supplied by the server and tenant header."""
+
     template_id: str = Field(default="default-rag-v1", min_length=1, max_length=128)
     chunks: list[DocumentChunk] = Field(min_length=1)
     template: str | None = None
@@ -68,7 +67,7 @@ class PackCreateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    @field_validator("tenant_id", "model_id", "tokenizer_id", "template_id")
+    @field_validator("template_id")
     @classmethod
     def normalize_identifiers(cls, value: str) -> str:
         return canonical_identifier(value)
@@ -79,7 +78,7 @@ class PackCreateRequest(BaseModel):
         if value is None:
             return value
         normalized = canonical_text(value)
-        fields: list[tuple[str, str, str | None]] = []
+        fields: list[tuple[str, str | None, str | None]] = []
         try:
             for _, field_name, format_spec, conversion in Formatter().parse(normalized):
                 if field_name is not None:
@@ -107,7 +106,7 @@ class PackCreateRequest(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def reject_duplicate_chunks(self) -> PackCreateRequest:
+    def reject_duplicate_chunks(self) -> PackRegistrationRequest:
         seen: set[tuple[str, str]] = set()
         for chunk in self.chunks:
             key = (chunk.doc_id, chunk.chunk_id)
@@ -115,6 +114,19 @@ class PackCreateRequest(BaseModel):
                 raise ValueError(f"duplicate chunk key: {chunk.doc_id}/{chunk.chunk_id}")
             seen.add(key)
         return self
+
+
+class PackCreateRequest(PackRegistrationRequest):
+    """Internal compiler input with server-authoritative runtime identity."""
+
+    tenant_id: str = Field(default="default", min_length=1, max_length=128)
+    model_id: str = Field(min_length=1, max_length=512)
+    tokenizer_id: str = Field(min_length=1, max_length=512)
+
+    @field_validator("tenant_id", "model_id", "tokenizer_id")
+    @classmethod
+    def normalize_authority_identifiers(cls, value: str) -> str:
+        return canonical_identifier(value)
 
 
 class ContextPack(BaseModel):
@@ -255,47 +267,105 @@ class PackPage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
-class AskRequest(BaseModel):
-    pack_id: str
-    question: str
+class CompletionRequest(BaseModel):
+    """OpenAI completions request with a required Flume context-pack extension."""
+
+    pack_id: str = Field(min_length=1, max_length=128)
+    prompt: str = Field(min_length=1, max_length=1_000_000)
     stream: bool = False
-    max_tokens: int = 256
-    temperature: float = 0.0
-    top_p: float = 1.0
-    stop: list[str] | None = None
+    max_tokens: int = Field(default=256, ge=1, le=1_048_576)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    stop: str | list[str] | None = None
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-class AskResponse(BaseModel):
-    pack_id: str
-    worker_url: str
+    @field_validator("pack_id")
+    @classmethod
+    def normalize_pack_id(cls, value: str) -> str:
+        return canonical_identifier(value)
+
+    @field_validator("prompt")
+    @classmethod
+    def normalize_prompt(cls, value: str) -> str:
+        normalized = canonical_text(value)
+        if not normalized:
+            raise ValueError("prompt cannot be empty")
+        return normalized
+
+    @field_validator("stop")
+    @classmethod
+    def validate_stop(cls, value: str | list[str] | None) -> str | list[str] | None:
+        if value is None:
+            return None
+        values = [value] if isinstance(value, str) else value
+        if not values or len(values) > 4:
+            raise ValueError("stop must contain between one and four strings")
+        if any(not item or len(item) > 512 for item in values):
+            raise ValueError("stop strings must contain between 1 and 512 characters")
+        return value
+
+    @field_validator("extra_body")
+    @classmethod
+    def bound_extra_body(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(value) > 32:
+            raise ValueError("extra_body cannot contain more than 32 fields")
+        return value
+
+
+class CompletionChoice(BaseModel):
     text: str
-    ttft_ms: float | None
-    latency_ms: float
-    prompt_tokens: int
-    output_tokens: int | None = None
+    index: int
+    logprobs: Any | None = None
     finish_reason: str | None = None
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+
+class CompletionUsage(BaseModel):
+    prompt_tokens: int = Field(ge=0)
+    completion_tokens: int = Field(ge=0)
+    total_tokens: int = Field(ge=0)
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+
+class CompletionResponse(BaseModel):
+    id: str
+    object: Literal["text_completion"]
+    created: int
+    model: str
+    choices: list[CompletionChoice]
+    usage: CompletionUsage
+
+    model_config = ConfigDict(extra="allow", frozen=True)
 
 
 class WarmRequest(BaseModel):
-    pack_id: str
     strategy: Literal["one_token", "echo_question"] = "one_token"
-    question: str = "warm"
+    question: str = Field(default="warm", min_length=1, max_length=16_384)
+
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class WarmResponse(BaseModel):
     pack_id: str
-    worker_url: str
+    worker_id: str
     warmed: bool
     latency_ms: float
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
 
 class WorkerStats(BaseModel):
-    worker_url: str
+    worker_id: str
     healthy: bool | None = None
     assigned_packs: int = 0
     affinity_hits: int = 0
     affinity_misses: int = 0
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class StatsResponse(BaseModel):
@@ -303,30 +373,4 @@ class StatsResponse(BaseModel):
     routes: int
     workers: list[WorkerStats]
 
-
-class BenchmarkRunRequest(BaseModel):
-    baseline: Literal[
-        "plain_vllm",
-        "vllm_apc",
-        "flume_stable",
-        "flume_warm_affinity",
-    ] = "flume_warm_affinity"
-    context_lengths: list[int] = Field(default_factory=lambda: [4096, 16384])
-    concurrency: int = 1
-    iterations: int = 3
-    questions: list[str] = Field(
-        default_factory=lambda: [
-            "Summarize the key policy.",
-            "What should support verify?",
-            "When is the refund window?",
-        ]
-    )
-
-
-class BenchmarkRun(BaseModel):
-    run_id: str
-    request: BenchmarkRunRequest
-    created_at: datetime = Field(default_factory=utc_now)
-    results: dict[str, Any] = Field(default_factory=dict)
-    status: Literal["created", "running", "completed", "failed"] = "created"
-    error: str | None = None
+    model_config = ConfigDict(extra="forbid", frozen=True)

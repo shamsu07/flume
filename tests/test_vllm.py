@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from flume.vllm import VLLMClient, VLLMUpstreamError
+from flume.vllm import VLLMClient, VLLMConnectionError, VLLMUpstreamError
 
 
 class FragmentedStream(httpx.AsyncByteStream):
@@ -103,4 +103,104 @@ async def test_stream_error_is_known_before_downstream_headers() -> None:
         )
 
     assert "sensitive" not in str(error.value)
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_inspection_handles_comments_crlf_and_fragmentation() -> None:
+    raw = (
+        b": keepalive\r\n\r\n"
+        b"event: ping\r\n\r\n"
+        b'data: {"choices":[{"text":"token"}]}\r\n\r\n'
+        b"data: [DONE]\r\n\r\n"
+    )
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=FragmentedStream([raw[:3], raw[3:19], raw[19:47], raw[47:71], raw[71:]]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    first_tokens: list[float] = []
+    client = VLLMClient(transport=httpx.MockTransport(handler))
+    await client.start()
+    stream = await client.open_stream_completion(
+        worker_url="http://worker",
+        model="model",
+        prompt=[1],
+        max_tokens=1,
+        temperature=0,
+        on_first_token=first_tokens.append,
+    )
+
+    forwarded = b"".join([chunk async for chunk in stream])
+
+    assert forwarded == raw
+    assert len(first_tokens) == 1
+    assert not VLLMClient.line_has_token(": keepalive")
+    assert not VLLMClient.line_has_token("event: ping")
+    assert not VLLMClient.line_has_token("data: [DONE]")
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_stream_closes_upstream_and_records_done_once() -> None:
+    class ClosingStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b": keepalive\n\n"
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    upstream = ClosingStream()
+    completions: list[float] = []
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=upstream)
+
+    client = VLLMClient(transport=httpx.MockTransport(handler))
+    await client.start()
+    stream = await client.open_stream_completion(
+        worker_url="http://worker",
+        model="model",
+        prompt=[1],
+        max_tokens=1,
+        temperature=0,
+        on_done=completions.append,
+    )
+
+    await stream.aclose()
+    await stream.aclose()
+
+    assert upstream.closed
+    assert len(completions) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_completion_leaves_the_single_retry_to_api_failover() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("unavailable", request=request)
+
+    client = VLLMClient(transport=httpx.MockTransport(handler))
+    await client.start()
+
+    with pytest.raises(VLLMConnectionError):
+        await client.complete(
+            worker_url="http://worker",
+            model="model",
+            prompt=[1],
+            max_tokens=1,
+            temperature=0,
+        )
+
+    assert calls == 1
     await client.close()

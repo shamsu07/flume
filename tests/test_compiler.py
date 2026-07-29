@@ -27,7 +27,8 @@ def _compiler(
             self.tokenizer_id = tokenizer_id
             self.revision = revision
 
-        def encode(self, text: str) -> list[int]:
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            del add_special_tokens
             return list(text.encode("utf-8"))
 
     return ContextPackCompiler(TestTokenizer(), model_id=model_id)
@@ -69,9 +70,7 @@ def test_pack_compilation_matches_golden_manifest_vector() -> None:
     assert pack.canonical_prefix_hash == (
         "7bb89597485016f8dbe305f21bdf93da3e43633e5d9eb74586f34bb25217255c"
     )
-    assert pack.token_hash == (
-        "f1c1869f36c49181e4b4fb208856a4cb63d7ed2127392406de38f4329f76f78f"
-    )
+    assert pack.token_hash == ("f1c1869f36c49181e4b4fb208856a4cb63d7ed2127392406de38f4329f76f78f")
     assert pack.token_count == 271
 
 
@@ -273,6 +272,29 @@ def test_prefix_tokens_are_preserved_when_question_is_appended() -> None:
 
     assert prompt_ids[: pack.token_count] == list(pack.prefix_token_ids)
     assert bytes(prompt_ids[pack.token_count :]).decode() == "What changed?\n\nAnswer:\n"
+
+
+def test_prefix_gets_special_tokens_once_and_suffix_gets_none() -> None:
+    calls: list[tuple[str, bool]] = []
+
+    class RecordingTokenizer:
+        tokenizer_id = "tokenizer-a"
+        revision = "revision-a"
+        fingerprint = sha256_json({"tokenizer": "recording"})
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            calls.append((text, add_special_tokens))
+            framing = [101, 102] if add_special_tokens else []
+            return [*framing, *text.encode()]
+
+    compiler = ContextPackCompiler(RecordingTokenizer())
+    pack = compiler.compile(_request())
+    prompt_ids = compiler.completion_token_ids(pack, "question")
+
+    assert [special_tokens for _, special_tokens in calls] == [True, False]
+    assert pack.prefix_token_ids[:2] == (101, 102)
+    assert prompt_ids[: pack.token_count] == list(pack.prefix_token_ids)
+    assert prompt_ids[pack.token_count : 2 + pack.token_count] != [101, 102]
 
 
 def test_pack_model_rejects_tampered_prefix_tokens() -> None:

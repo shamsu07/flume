@@ -5,7 +5,7 @@ from sqlalchemy import text
 
 from flume.compiler import ContextPackCompiler, DeterministicByteTokenizer
 from flume.models import DocumentChunk, PackCreateRequest
-from flume.store import ByteBoundedPackCache, FlumeStore
+from flume.store import ByteBoundedPackCache, FlumeStore, PackConflictError
 
 
 def make_pack(*, tenant_id: str = "demo", doc_id: str = "doc"):
@@ -46,9 +46,7 @@ async def test_store_scopes_packs_and_paginates(tmp_path) -> None:
     await store.init_schema()
     for index in range(3):
         pack = make_pack(doc_id=f"doc-{index}")
-        pack = pack.model_copy(
-            update={"created_at": datetime.now(UTC) + timedelta(seconds=index)}
-        )
+        pack = pack.model_copy(update={"created_at": datetime.now(UTC) + timedelta(seconds=index)})
         await store.save_pack(pack)
     other = make_pack(tenant_id="other")
     await store.save_pack(other)
@@ -92,3 +90,61 @@ def test_pack_cache_is_byte_bounded_and_tenant_scoped() -> None:
     assert cache.get("demo", first.pack_id) is None
     assert cache.get("other", second.pack_id) is None
     assert cache.get("demo", second.pack_id) is second
+
+
+@pytest.mark.asyncio
+async def test_store_filters_expired_packs_from_reads_lists_and_counts(tmp_path) -> None:
+    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
+    await store.init_schema()
+    expired = make_pack().model_copy(
+        update={
+            "created_at": datetime.now(UTC) - timedelta(seconds=5),
+            "ttl_seconds": 1,
+        }
+    )
+    await store.save_pack(expired)
+
+    assert await store.get_pack("demo", expired.pack_id) is None
+    assert (await store.list_packs("demo")).items == []
+    assert await store.counts("demo") == (0, 0)
+
+    cache = ByteBoundedPackCache(1_000_000)
+    cache.put(expired)
+    assert cache.get("demo", expired.pack_id) is None
+    assert cache.entries == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_bad_cursor_and_scopes_annotation_updates(tmp_path) -> None:
+    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
+    await store.init_schema()
+    pack = make_pack()
+    await store.save_pack(pack)
+
+    with pytest.raises(ValueError, match="invalid pagination cursor"):
+        await store.list_packs("demo", cursor="not-a-cursor")
+
+    assert await store.update_annotations("other", pack.pack_id, {"tag": "hidden"}) is None
+    first = await store.update_annotations("demo", pack.pack_id, {"tag": "one"})
+    second = await store.update_annotations("demo", pack.pack_id, {"tag": "two"})
+    assert first == {"tag": "one"}
+    assert second == {"tag": "two"}
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_detects_immutable_identity_conflicts(tmp_path) -> None:
+    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
+    await store.init_schema()
+    pack = make_pack()
+    await store.save_pack(pack)
+
+    async with store.session() as session:
+        await session.execute(
+            text("UPDATE context_packs SET token_count = token_count + 1 WHERE tenant_id = 'demo'")
+        )
+
+    with pytest.raises(PackConflictError):
+        await store.save_pack(pack)
+    await store.close()

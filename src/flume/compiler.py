@@ -30,8 +30,7 @@ class Tokenizer(Protocol):
     revision: str
     fingerprint: str
 
-    def encode(self, text: str) -> list[int]:
-        ...
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +53,10 @@ class DeterministicByteTokenizer:
             ),
         )
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        # Byte tokenization has no special-token vocabulary. Keeping the argument explicit
+        # makes this deterministic test double exercise the production policy.
+        del add_special_tokens
         return list(text.encode("utf-8"))
 
 
@@ -90,8 +92,8 @@ class HuggingFaceTokenizer:
             }
         )
 
-    def encode(self, text: str) -> list[int]:
-        return list(self._tokenizer.encode(text, add_special_tokens=False))
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        return list(self._tokenizer.encode(text, add_special_tokens=add_special_tokens))
 
 
 def load_tokenizer(
@@ -144,7 +146,10 @@ class ContextPackCompiler:
         template = canonical_text(request.template or DEFAULT_TEMPLATE)
         compiled_prefix = template.format(context=context)
 
-        token_ids = self.tokenizer.encode(compiled_prefix)
+        # Prefixes receive the tokenizer's framing tokens exactly once. User suffixes are
+        # encoded separately without framing so the persisted prefix remains byte-for-byte
+        # reusable across requests.
+        token_ids = self.tokenizer.encode(compiled_prefix, add_special_tokens=True)
 
         document_hash = sha256_json(
             {
@@ -206,7 +211,10 @@ class ContextPackCompiler:
         ):
             raise ValueError("pack tokenizer identity does not match compiler runtime")
         suffix = f"{canonical_text(question)}\n\nAnswer:\n"
-        return [*pack.prefix_token_ids, *self.tokenizer.encode(suffix)]
+        return [
+            *pack.prefix_token_ids,
+            *self.tokenizer.encode(suffix, add_special_tokens=False),
+        ]
 
     def _validate_tokenizer_identity(self) -> None:
         if not self.tokenizer.tokenizer_id.strip():
@@ -251,11 +259,7 @@ class ContextPackCompiler:
             rendered.append(
                 "\n".join(
                     [
-                        (
-                            f"<chunk doc_id={doc_id} "
-                            f"chunk_id={chunk_id} "
-                            f"version={version}>"
-                        ),
+                        (f"<chunk doc_id={doc_id} chunk_id={chunk_id} version={version}>"),
                         canonical_text(chunk.text),
                         f"</chunk>{metadata}",
                     ]
