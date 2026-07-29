@@ -3,13 +3,17 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import text
 
-from flume.compiler import ContextPackCompiler
+from flume.compiler import ContextPackCompiler, DeterministicByteTokenizer
 from flume.models import DocumentChunk, PackCreateRequest
 from flume.store import ByteBoundedPackCache, FlumeStore
 
 
 def make_pack(*, tenant_id: str = "demo", doc_id: str = "doc"):
-    return ContextPackCompiler().compile(
+    compiler = ContextPackCompiler(
+        DeterministicByteTokenizer(tokenizer_id="tokenizer", revision="byte-v1"),
+        model_id="model",
+    )
+    return compiler.compile(
         PackCreateRequest(
             tenant_id=tenant_id,
             model_id="model",
@@ -42,7 +46,9 @@ async def test_store_scopes_packs_and_paginates(tmp_path) -> None:
     await store.init_schema()
     for index in range(3):
         pack = make_pack(doc_id=f"doc-{index}")
-        pack.created_at = datetime.now(UTC) + timedelta(seconds=index)
+        pack = pack.model_copy(
+            update={"created_at": datetime.now(UTC) + timedelta(seconds=index)}
+        )
         await store.save_pack(pack)
     other = make_pack(tenant_id="other")
     await store.save_pack(other)

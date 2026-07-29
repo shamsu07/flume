@@ -77,7 +77,7 @@ class PackConflictError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class PackPage:
+class StoredPackPage:
     items: list[ContextPack]
     next_cursor: str | None
 
@@ -257,7 +257,7 @@ class FlumeStore:
         *,
         limit: int = 100,
         cursor: str | None = None,
-    ) -> PackPage:
+    ) -> StoredPackPage:
         limit = min(max(limit, 1), 200)
         now = datetime.now(UTC)
         statement = (
@@ -284,7 +284,7 @@ class FlumeStore:
         next_cursor = None
         if has_more and records:
             next_cursor = self._encode_cursor(records[-1].created_at, records[-1].pack_id)
-        return PackPage(
+        return StoredPackPage(
             items=[ContextPack.model_validate_json(record.data) for record in records],
             next_cursor=next_cursor,
         )

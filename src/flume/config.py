@@ -5,6 +5,8 @@ from functools import lru_cache
 from pydantic import Field, PositiveFloat, PositiveInt, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+INSECURE_CACHE_SALT_SECRET = "development-only-change-before-production"
+
 
 class Settings(BaseSettings):
     """Runtime settings loaded from environment variables and CLI overrides."""
@@ -17,7 +19,7 @@ class Settings(BaseSettings):
     vllm_workers: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
     model_id: str = "local-model"
     tokenizer_id: str = "local-tokenizer"
-    tokenizer_revision: str = "main"
+    tokenizer_revision: str = "0000000000000000000000000000000000000000"
     allow_remote_tokenizer: bool = False
     request_timeout_seconds: PositiveFloat = 120.0
     connect_timeout_seconds: PositiveFloat = 5.0
@@ -29,7 +31,11 @@ class Settings(BaseSettings):
     max_in_flight: PositiveInt = 256
     pack_cache_bytes: PositiveInt = 256 * 1024 * 1024
     sqlite_busy_timeout_ms: PositiveInt = 5_000
-    cache_salt_secret: str = "development-only-change-before-production"
+    cache_salt_secret: str = Field(
+        default=INSECURE_CACHE_SALT_SECRET,
+        min_length=32,
+        repr=False,
+    )
     metrics_enabled: bool = True
 
     @field_validator("vllm_workers", mode="before")
@@ -40,6 +46,13 @@ class Settings(BaseSettings):
         if isinstance(value, list):
             return [str(item).rstrip("/") for item in value]
         raise TypeError("vllm_workers must be a comma-separated string or list")
+
+    @field_validator("cache_salt_secret")
+    @classmethod
+    def validate_cache_salt_secret(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("cache_salt_secret cannot have leading or trailing whitespace")
+        return value
 
 
 @lru_cache
