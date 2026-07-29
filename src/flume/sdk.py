@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from flume.compiler import ContextPackCompiler
+from flume.hashing import canonical_identifier, canonical_text, sha256_text
 from flume.models import (
     AskRequest,
     BenchmarkRun,
@@ -24,9 +26,16 @@ def compile_pack(
     tenant_id: str,
     model_id: str,
     tokenizer_id: str,
+    tokenizer_revision: str,
     template_id: str = "default-rag-v1",
+    allow_remote_tokenizer: bool = False,
 ) -> ContextPack:
-    compiler = ContextPackCompiler()
+    compiler = ContextPackCompiler.from_pretrained(
+        tokenizer_id=tokenizer_id,
+        tokenizer_revision=tokenizer_revision,
+        model_id=model_id,
+        allow_remote_tokenizer=allow_remote_tokenizer,
+    )
     return compiler.compile(
         PackCreateRequest(
             tenant_id=tenant_id,
@@ -38,19 +47,31 @@ def compile_pack(
     )
 
 
-def chunks_from_files(paths: list[Path]) -> list[DocumentChunk]:
-    chunks = []
-    for index, path in enumerate(paths):
+def chunks_from_files(
+    paths: list[Path],
+    *,
+    logical_names: Mapping[Path, str] | None = None,
+) -> list[DocumentChunk]:
+    """Create path-independent chunks using stable logical names and content versions."""
+    chunks: list[DocumentChunk] = []
+    seen_names: set[str] = set()
+    logical_names = logical_names or {}
+    for path in paths:
+        logical_name = canonical_identifier(logical_names.get(path, path.name))
+        if logical_name in seen_names:
+            raise ValueError(f"duplicate logical file name: {logical_name}")
+        seen_names.add(logical_name)
+        text = canonical_text(path.read_text(encoding="utf-8"))
         chunks.append(
             DocumentChunk(
-                doc_id=path.stem,
-                chunk_id=str(index),
-                version=str(int(path.stat().st_mtime)),
-                text=path.read_text(encoding="utf-8"),
-                metadata={"path": str(path)},
+                doc_id=logical_name,
+                chunk_id="0",
+                version=sha256_text(text),
+                text=text,
+                metadata={"source_name": logical_name},
             )
         )
-    return chunks
+    return sorted(chunks, key=lambda chunk: (chunk.doc_id, chunk.chunk_id, chunk.version))
 
 
 class FlumeClient:
