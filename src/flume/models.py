@@ -7,7 +7,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from flume.hashing import canonical_identifier, canonical_json_value, canonical_text
+from flume.hashing import (
+    canonical_identifier,
+    canonical_json_value,
+    canonical_text,
+    sha256_text,
+    sha256_token_ids,
+    stable_pack_id,
+)
 
 
 def utc_now() -> datetime:
@@ -116,6 +123,8 @@ class ContextPack(BaseModel):
     tenant_id: str
     model_id: str
     tokenizer_id: str
+    tokenizer_revision: str
+    tokenizer_fingerprint: str
     template_id: str
     template_digest: str
     document_hash: str
@@ -123,13 +132,76 @@ class ContextPack(BaseModel):
     token_hash: str
     token_count: int
     compiled_prefix: str
+    prefix_token_ids: tuple[int, ...]
     created_at: datetime = Field(default_factory=utc_now)
     ttl_seconds: int | None = None
     order_policy: OrderPolicy = OrderPolicy.stable
     tags: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @field_validator(
+        "template_digest",
+        "document_hash",
+        "canonical_prefix_hash",
+        "token_hash",
+        "tokenizer_fingerprint",
+    )
+    @classmethod
+    def require_sha256(cls, value: str) -> str:
+        if len(value) != 64:
+            raise ValueError("digest must contain 64 hexadecimal characters")
+        try:
+            int(value, 16)
+        except ValueError as exc:
+            raise ValueError("digest must contain 64 hexadecimal characters") from exc
+        return value.lower()
+
+    @field_validator("compiled_prefix")
+    @classmethod
+    def require_canonical_prefix(cls, value: str) -> str:
+        if canonical_text(value) != value:
+            raise ValueError("compiled prefix is not canonical text")
+        return value
+
+    @model_validator(mode="after")
+    def enforce_manifest_invariants(self) -> ContextPack:
+        if not self.prefix_token_ids:
+            raise ValueError("compiled prefix token ids cannot be empty")
+        if self.token_count != len(self.prefix_token_ids):
+            raise ValueError("token_count does not match compiled prefix token ids")
+        if self.token_hash != sha256_token_ids(list(self.prefix_token_ids)):
+            raise ValueError("token_hash does not match compiled prefix token ids")
+        if self.canonical_prefix_hash != sha256_text(self.compiled_prefix):
+            raise ValueError("canonical_prefix_hash does not match compiled prefix")
+        if self.pack_id != stable_pack_id(self.immutable_manifest()):
+            raise ValueError("pack_id does not match immutable manifest")
+        return self
+
+    def immutable_manifest(self) -> dict[str, str | int]:
+        return {
+            "compiler_format_version": self.compiler_format_version,
+            "tenant_id": self.tenant_id,
+            "model_id": self.model_id,
+            "tokenizer_id": self.tokenizer_id,
+            "tokenizer_revision": self.tokenizer_revision,
+            "tokenizer_fingerprint": self.tokenizer_fingerprint,
+            "template_id": self.template_id,
+            "template_digest": self.template_digest,
+            "order_policy": self.order_policy.value,
+            "document_hash": self.document_hash,
+            "canonical_prefix_hash": self.canonical_prefix_hash,
+            "token_hash": self.token_hash,
+            "token_count": self.token_count,
+        }
+
+    def operational_annotations(self) -> dict[str, Any]:
+        return {
+            "ttl_seconds": self.ttl_seconds,
+            "tags": list(self.tags),
+            "metadata": self.metadata,
+        }
 
     @property
     def expired(self) -> bool:
@@ -144,6 +216,8 @@ class ContextPack(BaseModel):
             compiler_format_version=self.compiler_format_version,
             model_id=self.model_id,
             tokenizer_id=self.tokenizer_id,
+            tokenizer_revision=self.tokenizer_revision,
+            tokenizer_fingerprint=self.tokenizer_fingerprint,
             template_id=self.template_id,
             document_hash=self.document_hash,
             canonical_prefix_hash=self.canonical_prefix_hash,
@@ -161,6 +235,8 @@ class PackSummary(BaseModel):
     compiler_format_version: str
     model_id: str
     tokenizer_id: str
+    tokenizer_revision: str
+    tokenizer_fingerprint: str
     template_id: str
     document_hash: str
     canonical_prefix_hash: str

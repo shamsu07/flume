@@ -26,9 +26,16 @@ def compile_pack(
     tenant_id: str,
     model_id: str,
     tokenizer_id: str,
+    tokenizer_revision: str,
     template_id: str = "default-rag-v1",
+    allow_remote_tokenizer: bool = False,
 ) -> ContextPack:
-    compiler = ContextPackCompiler()
+    compiler = ContextPackCompiler.from_pretrained(
+        tokenizer_id=tokenizer_id,
+        tokenizer_revision=tokenizer_revision,
+        model_id=model_id,
+        allow_remote_tokenizer=allow_remote_tokenizer,
+    )
     return compiler.compile(
         PackCreateRequest(
             tenant_id=tenant_id,

@@ -73,6 +73,10 @@ def sha256_json(value: Any) -> str:
     return sha256_text(canonical_json(value))
 
 
+def stable_pack_id(manifest: Mapping[str, Any]) -> str:
+    return f"pack_{sha256_json(manifest)[:24]}"
+
+
 def sha256_token_ids(token_ids: list[int]) -> str:
     digest = hashlib.sha256()
     for token_id in token_ids:
