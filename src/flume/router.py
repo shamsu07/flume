@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections import Counter
+import time
+from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 from flume.metrics import ROUTER_AFFINITY, ROUTER_UNAVAILABLE
@@ -17,6 +19,13 @@ class NoHealthyWorkers(RuntimeError):
     """Raised immediately when the cached health snapshot has no usable worker."""
 
 
+@dataclass(frozen=True, slots=True)
+class RoutingState:
+    worker_url: str
+    last_seen: float
+    spill_until: float
+
+
 class PackRouter:
     """Health-aware rendezvous hashing with a background-only health hot path."""
 
@@ -26,16 +35,47 @@ class PackRouter:
         health_checker: HealthChecker | None = None,
         *,
         refresh_seconds: float = 5.0,
+        routing_policy: str = "hrw",
+        load_slack: int = 2,
+        spill_hold_seconds: float = 2.0,
+        capacity_weights: dict[str, float] | None = None,
+        state_max_entries: int = 10_000,
+        state_ttl_seconds: float = 600.0,
+        clock: Callable[[], float] = time.monotonic,
     ):
         if not worker_urls:
             raise ValueError("at least one vLLM worker is required")
+        if routing_policy not in {"hrw", "bounded_hrw"}:
+            raise ValueError("routing_policy must be 'hrw' or 'bounded_hrw'")
+        if load_slack < 0:
+            raise ValueError("load_slack cannot be negative")
+        if spill_hold_seconds < 0:
+            raise ValueError("spill_hold_seconds cannot be negative")
+        if state_max_entries < 1:
+            raise ValueError("state_max_entries must be positive")
+        if state_ttl_seconds <= 0:
+            raise ValueError("state_ttl_seconds must be positive")
         self.worker_urls = tuple(dict.fromkeys(url.rstrip("/") for url in worker_urls))
+        weights = capacity_weights or {}
+        if set(weights).difference(self.worker_urls):
+            raise ValueError("capacity_weights contains an unknown worker")
+        if any(weight <= 0 for weight in weights.values()):
+            raise ValueError("capacity_weights must be greater than zero")
         self.health_checker = health_checker
         self.refresh_seconds = refresh_seconds
+        self.routing_policy = routing_policy
+        self.load_slack = load_slack
+        self.spill_hold_seconds = spill_hold_seconds
+        self.capacity_weights = {
+            worker: weights.get(worker, 1.0) for worker in self.worker_urls
+        }
+        self.state_max_entries = state_max_entries
+        self.state_ttl_seconds = state_ttl_seconds
+        self._clock = clock
         initial_health = health_checker is None
         self._health = {worker: initial_health for worker in self.worker_urls}
         self._monitor_task: asyncio.Task[None] | None = None
-        self._assignments: dict[str, str] = {}
+        self._assignments: OrderedDict[str, RoutingState] = OrderedDict()
         self._affinity: Counter[str] = Counter()
         self._local_in_flight: Counter[str] = Counter()
 
@@ -86,16 +126,62 @@ class PackRouter:
         if not candidates:
             ROUTER_UNAVAILABLE.inc()
             raise NoHealthyWorkers("no healthy vLLM workers")
-        worker = max(candidates, key=lambda item: self._score(pack_id, item))
-        previous = self._assignments.get(pack_id)
-        if previous == worker:
+        ranked = sorted(candidates, key=lambda item: self._score(pack_id, item), reverse=True)
+        primary = ranked[0]
+        now = self._clock()
+        previous = self._get_state(pack_id, now)
+        worker = primary
+        if self.routing_policy == "bounded_hrw" and len(ranked) > 1:
+            secondary = ranked[1]
+            if (
+                previous is not None
+                and previous.worker_url == secondary
+                and previous.spill_until > now
+            ):
+                worker = secondary
+            elif self._effective_load(primary) > (
+                self._effective_load(secondary) + self.load_slack
+            ):
+                worker = secondary
+
+        if previous is not None and previous.worker_url == worker:
             self._affinity["hit"] += 1
             ROUTER_AFFINITY.labels(result="hit").inc()
         else:
             self._affinity["miss"] += 1
             ROUTER_AFFINITY.labels(result="miss").inc()
-            self._assignments[pack_id] = worker
+        spill_until = now + self.spill_hold_seconds if worker != primary else 0.0
+        self._record_state(
+            pack_id,
+            RoutingState(worker_url=worker, last_seen=now, spill_until=spill_until),
+            now,
+        )
         return worker
+
+    def _get_state(self, pack_id: str, now: float) -> RoutingState | None:
+        state = self._assignments.get(pack_id)
+        if state is None:
+            return None
+        if now - state.last_seen >= self.state_ttl_seconds:
+            del self._assignments[pack_id]
+            return None
+        self._assignments.move_to_end(pack_id)
+        return state
+
+    def _record_state(self, pack_id: str, state: RoutingState, now: float) -> None:
+        self._assignments[pack_id] = state
+        self._assignments.move_to_end(pack_id)
+        while self._assignments:
+            oldest_pack_id, oldest = next(iter(self._assignments.items()))
+            if (
+                len(self._assignments) <= self.state_max_entries
+                and now - oldest.last_seen < self.state_ttl_seconds
+            ):
+                break
+            del self._assignments[oldest_pack_id]
+
+    def _effective_load(self, worker_url: str) -> float:
+        return self._local_in_flight[worker_url] / self.capacity_weights[worker_url]
 
     def mark_unhealthy(self, worker_url: str) -> None:
         if worker_url in self._health:
@@ -122,7 +208,7 @@ class PackRouter:
         return dict(self._health)
 
     def stats(self) -> dict[str, dict[str, int]]:
-        assigned = Counter(self._assignments.values())
+        assigned = Counter(state.worker_url for state in self._assignments.values())
         return {
             worker: {
                 "assigned_packs": assigned[worker],

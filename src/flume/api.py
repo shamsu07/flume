@@ -97,6 +97,12 @@ def create_app(
         settings.vllm_workers,
         health_checker=vllm.health,
         refresh_seconds=settings.health_refresh_seconds,
+        routing_policy=settings.routing_policy,
+        load_slack=settings.routing_load_slack,
+        spill_hold_seconds=settings.routing_spill_hold_ms / 1_000,
+        capacity_weights=settings.worker_capacity_weights,
+        state_max_entries=settings.routing_state_max_entries,
+        state_ttl_seconds=settings.routing_state_ttl_seconds,
     )
     cache = ByteBoundedPackCache(settings.pack_cache_bytes)
     warmups: WarmupSingleFlight[tuple[CompletionResult, str]] = WarmupSingleFlight()
