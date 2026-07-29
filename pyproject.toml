@@ -31,6 +31,7 @@ dev = [
 
 [project.scripts]
 flume = "flume.cli:main"
+flume-benchmark = "flume.benchmark_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/flume"]
