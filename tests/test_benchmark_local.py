@@ -10,11 +10,14 @@ from flume.benchmark_cli import local_markdown_report
 from flume.benchmark_local import (
     LocalSample,
     ReadinessKind,
+    WorkloadKind,
+    build_workload_fixture,
     complete,
     is_port_collision,
     latency_summary,
     phase_snapshot,
     run_local_benchmark,
+    start_server,
     wait_for_server,
 )
 
@@ -172,6 +175,24 @@ def test_benchmark_server_runners_build_apps(monkeypatch, tmp_path) -> None:
     )
     benchmark_server.main()
     assert calls[-1][2] == 8104
+
+
+def test_external_harness_selects_target_source_tree(monkeypatch, tmp_path) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_popen(command: list[str], **kwargs: object) -> SimpleNamespace:
+        seen["command"] = command
+        seen.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("flume.benchmark_local.subprocess.Popen", fake_popen)
+    start_server("worker", "--port", "8101", source_tree=tmp_path)
+
+    assert str(seen["command"][1]).endswith("benchmark_server.py")
+    assert str(seen["env"]["PYTHONPATH"]).startswith(str(tmp_path / "src"))
+    first = build_workload_fixture(WorkloadKind.uniform, 20, seed=7)
+    second = build_workload_fixture(WorkloadKind.uniform, 20, seed=7)
+    assert first == second
 
 
 @pytest.mark.asyncio
