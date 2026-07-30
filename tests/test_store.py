@@ -1,37 +1,150 @@
-from flume.compiler import ContextPackCompiler
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy import text
+
+from flume.compiler import ContextPackCompiler, DeterministicByteTokenizer
 from flume.models import DocumentChunk, PackCreateRequest
-from flume.store import FlumeStore
+from flume.store import ByteBoundedPackCache, FlumeStore, PackConflictError
 
 
-def test_store_round_trips_pack(tmp_path) -> None:
-    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
-    store.init_schema()
-    pack = ContextPackCompiler().compile(
+def make_pack(*, tenant_id: str = "demo", doc_id: str = "doc"):
+    compiler = ContextPackCompiler(
+        DeterministicByteTokenizer(tokenizer_id="tokenizer", revision="byte-v1"),
+        model_id="model",
+    )
+    return compiler.compile(
         PackCreateRequest(
-            tenant_id="demo",
+            tenant_id=tenant_id,
             model_id="model",
             tokenizer_id="tokenizer",
-            chunks=[DocumentChunk(doc_id="doc", text="hello")],
+            chunks=[DocumentChunk(doc_id=doc_id, text="hello")],
         )
     )
 
-    store.save_pack(pack)
-    loaded = store.get_pack(pack.pack_id)
 
-    assert loaded is not None
-    assert loaded.pack_id == pack.pack_id
-    assert loaded.compiled_prefix == pack.compiled_prefix
-    assert len(store.list_packs()) == 1
-
-
-def test_store_tracks_routes(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_store_round_trips_pack_idempotently(tmp_path) -> None:
     store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
-    store.init_schema()
+    await store.init_schema()
+    pack = make_pack()
 
-    store.save_route("pack-a", "http://worker-a", hit=True)
-    store.save_route("pack-a", "http://worker-a", hit=True)
-    route = store.get_route("pack-a")
+    first = await store.save_pack(pack)
+    second = await store.save_pack(pack)
+    loaded = await store.get_pack("demo", pack.pack_id)
 
-    assert route is not None
-    assert route.worker_url == "http://worker-a"
-    assert route.affinity_hits == 2
+    assert first.pack_id == second.pack_id
+    assert loaded is not None
+    assert loaded.compiled_prefix == pack.compiled_prefix
+    assert len((await store.list_packs("demo")).items) == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_scopes_packs_and_paginates(tmp_path) -> None:
+    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
+    await store.init_schema()
+    for index in range(3):
+        pack = make_pack(doc_id=f"doc-{index}")
+        pack = pack.model_copy(update={"created_at": datetime.now(UTC) + timedelta(seconds=index)})
+        await store.save_pack(pack)
+    other = make_pack(tenant_id="other")
+    await store.save_pack(other)
+
+    first = await store.list_packs("demo", limit=2)
+    second = await store.list_packs("demo", limit=2, cursor=first.next_cursor)
+
+    assert len(first.items) == 2
+    assert first.next_cursor is not None
+    assert len(second.items) == 1
+    assert await store.get_pack("demo", other.pack_id) is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_enables_sqlite_safety_pragmas(tmp_path) -> None:
+    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}", busy_timeout_ms=1234)
+    await store.init_schema()
+
+    async with store.engine.connect() as connection:
+        journal_mode = (await connection.execute(text("PRAGMA journal_mode"))).scalar_one()
+        busy_timeout = (await connection.execute(text("PRAGMA busy_timeout"))).scalar_one()
+        foreign_keys = (await connection.execute(text("PRAGMA foreign_keys"))).scalar_one()
+
+    assert journal_mode == "wal"
+    assert busy_timeout == 1234
+    assert foreign_keys == 1
+    await store.close()
+
+
+def test_pack_cache_is_byte_bounded_and_tenant_scoped() -> None:
+    first = make_pack(doc_id="one")
+    second = make_pack(doc_id="two")
+    entry_size = len(first.model_dump_json().encode())
+    cache = ByteBoundedPackCache(max_bytes=entry_size + 16)
+
+    cache.put(first)
+    cache.put(second)
+
+    assert cache.entries == 1
+    assert cache.get("demo", first.pack_id) is None
+    assert cache.get("other", second.pack_id) is None
+    assert cache.get("demo", second.pack_id) is second
+
+
+@pytest.mark.asyncio
+async def test_store_filters_expired_packs_from_reads_lists_and_counts(tmp_path) -> None:
+    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
+    await store.init_schema()
+    expired = make_pack().model_copy(
+        update={
+            "created_at": datetime.now(UTC) - timedelta(seconds=5),
+            "ttl_seconds": 1,
+        }
+    )
+    await store.save_pack(expired)
+
+    assert await store.get_pack("demo", expired.pack_id) is None
+    assert (await store.list_packs("demo")).items == []
+    assert await store.counts("demo") == (0, 0)
+
+    cache = ByteBoundedPackCache(1_000_000)
+    cache.put(expired)
+    assert cache.get("demo", expired.pack_id) is None
+    assert cache.entries == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_bad_cursor_and_scopes_annotation_updates(tmp_path) -> None:
+    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
+    await store.init_schema()
+    pack = make_pack()
+    await store.save_pack(pack)
+
+    with pytest.raises(ValueError, match="invalid pagination cursor"):
+        await store.list_packs("demo", cursor="not-a-cursor")
+
+    assert await store.update_annotations("other", pack.pack_id, {"tag": "hidden"}) is None
+    first = await store.update_annotations("demo", pack.pack_id, {"tag": "one"})
+    second = await store.update_annotations("demo", pack.pack_id, {"tag": "two"})
+    assert first == {"tag": "one"}
+    assert second == {"tag": "two"}
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_detects_immutable_identity_conflicts(tmp_path) -> None:
+    store = FlumeStore(f"sqlite:///{tmp_path / 'flume.db'}")
+    await store.init_schema()
+    pack = make_pack()
+    await store.save_pack(pack)
+
+    async with store.session() as session:
+        await session.execute(
+            text("UPDATE context_packs SET token_count = token_count + 1 WHERE tenant_id = 'demo'")
+        )
+
+    with pytest.raises(PackConflictError):
+        await store.save_pack(pack)
+    await store.close()

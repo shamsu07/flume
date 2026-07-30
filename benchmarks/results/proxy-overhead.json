@@ -1,0 +1,123 @@
+{
+  "schema_version": 3,
+  "benchmark": "local_proxy_overhead",
+  "environment": {
+    "timestamp_utc": "2026-07-29T15:57:25.244556+00:00",
+    "hostname": "macpro",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.12.13",
+    "logical_cpu_count": 15,
+    "git": {
+      "commit": "1f4315919019630b552c694b25c74b26a1524f99",
+      "dirty": false,
+      "branch": "codex/production-hardening"
+    }
+  },
+  "configuration": {
+    "requests_per_path": 1000,
+    "concurrency": 32,
+    "warmup_requests_per_path": 25,
+    "timeout_seconds": 30.0,
+    "embedded_proxy": true,
+    "mock_upstream": true,
+    "gate_reference": "minimal_pooled_two_hop_proxy",
+    "proxy_api_mode": "v1",
+    "tenant_header": {
+      "X-Flume-Tenant": "benchmark"
+    },
+    "model_id": "mock-model",
+    "tokenizer_id": "mock-tokenizer",
+    "tokenizer_revision": "byte-v1",
+    "prompt_tokens": 232
+  },
+  "measurements": {
+    "direct_upstream": {
+      "requests": 1000,
+      "errors": 0,
+      "duration_seconds": 1.5356838330044411,
+      "throughput_rps": 651.175703297977,
+      "p50_ms": 35.757687510340475,
+      "p95_ms": 137.78028569067828,
+      "p99_ms": 230.6366633507423,
+      "minimum_ms": 6.754792004358023,
+      "maximum_ms": 256.55229098629206
+    },
+    "reference_proxy": {
+      "requests": 1000,
+      "errors": 0,
+      "duration_seconds": 3.468608791998122,
+      "throughput_rps": 288.30002458246133,
+      "p50_ms": 86.69979200931266,
+      "p95_ms": 231.5808687388198,
+      "p99_ms": 320.4322324146051,
+      "minimum_ms": 14.991250005550683,
+      "maximum_ms": 434.32512501021847
+    },
+    "flume": {
+      "requests": 1000,
+      "errors": 0,
+      "duration_seconds": 3.566096374997869,
+      "throughput_rps": 280.4186692796819,
+      "p50_ms": 99.3884580093436,
+      "p95_ms": 198.00436461518984,
+      "p99_ms": 257.11539544165134,
+      "minimum_ms": 37.717416998930275,
+      "maximum_ms": 486.6707500186749
+    }
+  },
+  "comparison": {
+    "flume_vs_reference_proxy": {
+      "incremental_p50_ms": 12.688666000030935,
+      "incremental_p95_ms": -33.576504123629945,
+      "incremental_p99_ms": -63.31683697295375,
+      "throughput_ratio": 0.9726626617039184
+    },
+    "flume_vs_direct_upstream": {
+      "incremental_p50_ms": 63.63077049900312,
+      "incremental_p95_ms": 60.22407892451156,
+      "incremental_p99_ms": 26.478732090909034,
+      "throughput_ratio": 0.4306344168854267
+    }
+  },
+  "baseline_comparison": {
+    "source": "benchmarks/results/proxy-overhead-baseline.json",
+    "baseline_commit": "5b3dd47a9320af1ad267c5f92fe6683eb1e59d48",
+    "baseline_incremental_p99_ms": 918.8278693918253,
+    "baseline_throughput_ratio": 0.18012094232104567,
+    "baseline_health_probes": 1000,
+    "incremental_p99_reduction_percent": 97.1182053817724,
+    "throughput_ratio_multiplier": 2.3908070396271217,
+    "health_probe_reduction_percent": 100.0
+  },
+  "instrumentation": {
+    "mock_upstream": {
+      "health_probes": 0,
+      "completions": 3000
+    },
+    "embedded_proxy": {
+      "database_statements": 0,
+      "database_writes": 0,
+      "upstream_client_instances_observed": 1,
+      "upstream_client_reused": true
+    }
+  },
+  "mock_upstream_counts": {
+    "health": 0,
+    "completions": 3000
+  },
+  "gates": {
+    "passed": true,
+    "checks": {
+      "concurrency_is_32": true,
+      "at_least_1000_requests_per_path": true,
+      "zero_request_errors": true,
+      "zero_request_path_health_probes": true,
+      "zero_request_path_database_writes": true,
+      "single_reused_upstream_client": true,
+      "incremental_p99_at_most_10_ms": true,
+      "throughput_ratio_at_least_0_9": true
+    }
+  }
+}

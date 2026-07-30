@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "not_run",
+  "recorded_at_utc": "2026-07-29T15:20:00+00:00",
+  "commit": "a83f5df",
+  "hardware": {
+    "hostname": "macpro",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "machine": "arm64",
+    "logical_cpu_count": 15,
+    "nvidia_gpu": null
+  },
+  "reason": "No NVIDIA GPU or remote vLLM endpoint was available in the implementation environment.",
+  "samples": 0,
+  "results": {}
+}

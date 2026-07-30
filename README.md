@@ -6,7 +6,7 @@ turning retrieved documents into deterministic, versioned, cache-stable context
 packs.
 
 Flume does **not** replace vLLM's KV cache, LMCache, SGLang HiCache, vector
-databases, or retrieval systems. V0 sits above vLLM and focuses on prompt
+databases, or retrieval systems. Flume sits above vLLM and focuses on prompt
 determinism, warmup, worker affinity, and observability.
 
 ## Why
@@ -57,7 +57,12 @@ python -m vllm.entrypoints.openai.api_server \
 Start Flume:
 
 ```bash
-flume serve --vllm-worker http://localhost:8000 --model meta-llama/Llama-3.1-8B-Instruct
+export FLUME_TOKENIZER_REVISION=<immutable-hugging-face-commit>
+export FLUME_CACHE_SALT_SECRET=<high-entropy-secret>
+flume serve \
+  --vllm-worker http://localhost:8000 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --tokenizer meta-llama/Llama-3.1-8B-Instruct
 ```
 
 Register a pack:
@@ -65,14 +70,33 @@ Register a pack:
 ```bash
 flume pack create \
   --tenant demo \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --tokenizer meta-llama/Llama-3.1-8B-Instruct \
   examples/policy.txt
 ```
 
 Warm and ask:
 
 ```bash
-flume warm <pack_id>
-flume ask <pack_id> "What are the refund rules?"
+flume warm --tenant demo <pack_id>
+flume ask --tenant demo <pack_id> "What are the refund rules?"
 ```
+
+The service owns the model, tokenizer, and immutable tokenizer revision.
+Clients cannot override them while registering packs or completing prompts.
+Production deployments should use the tenant-scoped `/v1` interface behind an
+authenticated private gateway:
+
+```bash
+curl http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Flume-Tenant: demo' \
+  -d '{"pack_id":"<pack_id>","prompt":"What are the refund rules?","max_tokens":64}'
+```
+
+See:
+
+- [Architecture](docs/architecture.md)
+- [Configuration](docs/configuration.md)
+- [Deployment and security](docs/deployment-security.md)
+- [Failure semantics](docs/failure-semantics.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Changelog](CHANGELOG.md)

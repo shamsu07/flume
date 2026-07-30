@@ -8,6 +8,32 @@ from typing import Any
 
 import httpx
 
+Prompt = str | list[int]
+RESERVED_EXTRA_FIELDS = {
+    "cache_salt",
+    "max_tokens",
+    "model",
+    "prompt",
+    "stop",
+    "stream",
+    "temperature",
+    "top_p",
+}
+
+
+class VLLMError(RuntimeError):
+    """Base error safe for API translation without upstream response bodies."""
+
+
+class VLLMConnectionError(VLLMError):
+    pass
+
+
+class VLLMUpstreamError(VLLMError):
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"vLLM returned HTTP {status_code}")
+
 
 @dataclass(slots=True)
 class CompletionResult:
@@ -19,45 +45,158 @@ class CompletionResult:
     finish_reason: str | None
 
 
+class VLLMStream:
+    """An already validated upstream stream that forwards raw bytes unchanged."""
+
+    def __init__(
+        self,
+        response: httpx.Response,
+        *,
+        started: float,
+        on_first_token: Callable[[float], None] | None = None,
+        on_done: Callable[[float], None] | None = None,
+    ):
+        self.response = response
+        self.started = started
+        self.on_first_token = on_first_token
+        self.on_done = on_done
+        self._first_token_seen = False
+        self._buffer = b""
+        self._event_data: list[str] = []
+        self._closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self.response.aiter_raw():
+                self._inspect(chunk)
+                yield chunk
+        finally:
+            await self.aclose()
+
+    def _inspect(self, chunk: bytes) -> None:
+        if self._first_token_seen:
+            return
+        self._buffer += chunk
+        while b"\n" in self._buffer:
+            raw_line, self._buffer = self._buffer.split(b"\n", 1)
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            self._inspect_line(raw_line.decode("utf-8", errors="replace"))
+            if self._first_token_seen:
+                self._buffer = b""
+                return
+
+    def _inspect_line(self, line: str) -> None:
+        if not line:
+            data = "\n".join(self._event_data)
+            self._event_data.clear()
+            if VLLMClient.data_has_token(data):
+                self._first_token_seen = True
+                if self.on_first_token is not None:
+                    self.on_first_token((time.perf_counter() - self.started) * 1000)
+            return
+        if line.startswith(":"):
+            return
+        field, separator, value = line.partition(":")
+        if field != "data":
+            return
+        if separator and value.startswith(" "):
+            value = value[1:]
+        self._event_data.append(value)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.response.aclose()
+        finally:
+            if self.on_done is not None:
+                self.on_done((time.perf_counter() - self.started) * 1000)
+
+
 class VLLMClient:
-    def __init__(self, timeout_seconds: float = 120.0):
+    def __init__(
+        self,
+        timeout_seconds: float = 120.0,
+        *,
+        connect_timeout_seconds: float = 5.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.timeout_seconds = timeout_seconds
+        self.connect_timeout_seconds = connect_timeout_seconds
+        self.transport = transport
+        self._client: httpx.AsyncClient | None = None
+
+    async def start(self) -> None:
+        if self._client is not None:
+            return
+        timeout = httpx.Timeout(self.timeout_seconds, connect=self.connect_timeout_seconds)
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            transport=self.transport,
+            limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
+        )
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            raise RuntimeError("vLLM client has not been started")
+        return self._client
 
     async def health(self, worker_url: str) -> bool:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{worker_url.rstrip('/')}/health")
+        try:
+            response = await self.client.get(
+                f"{worker_url.rstrip('/')}/health",
+                timeout=self.connect_timeout_seconds,
+            )
             return response.status_code < 500
+        except httpx.HTTPError:
+            return False
 
     async def complete(
         self,
         *,
         worker_url: str,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         max_tokens: int,
         temperature: float,
         top_p: float = 1.0,
-        stop: list[str] | None = None,
+        stop: str | list[str] | None = None,
+        cache_salt: str | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> CompletionResult:
-        payload: dict[str, Any] = {
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": False,
-        }
-        if stop:
-            payload["stop"] = stop
-        if extra_body:
-            payload.update(extra_body)
-
+        payload = self._payload(
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            stream=False,
+            cache_salt=cache_salt,
+            extra_body=extra_body,
+        )
         started = time.perf_counter()
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(f"{worker_url.rstrip('/')}/v1/completions", json=payload)
-            response.raise_for_status()
+        try:
+            response = await self.client.post(
+                f"{worker_url.rstrip('/')}/v1/completions",
+                json=payload,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise VLLMConnectionError("could not connect to vLLM") from exc
+        if response.is_error:
+            raise VLLMUpstreamError(response.status_code)
+        try:
             body = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise VLLMError("vLLM returned invalid JSON") from exc
         latency_ms = (time.perf_counter() - started) * 1000
 
         choice = (body.get("choices") or [{}])[0]
@@ -71,68 +210,106 @@ class VLLMClient:
             finish_reason=choice.get("finish_reason"),
         )
 
-    async def stream_completion(
+    async def open_stream_completion(
         self,
         *,
         worker_url: str,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         max_tokens: int,
         temperature: float,
         top_p: float = 1.0,
-        stop: list[str] | None = None,
+        stop: str | list[str] | None = None,
+        cache_salt: str | None = None,
         extra_body: dict[str, Any] | None = None,
         on_first_token: Callable[[float], None] | None = None,
         on_done: Callable[[float], None] | None = None,
-    ) -> AsyncIterator[bytes]:
+    ) -> VLLMStream:
+        payload = self._payload(
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            stream=True,
+            cache_salt=cache_salt,
+            extra_body=extra_body,
+        )
+        request = self.client.build_request(
+            "POST",
+            f"{worker_url.rstrip('/')}/v1/completions",
+            json=payload,
+            timeout=self.timeout_seconds,
+        )
+        started = time.perf_counter()
+        try:
+            response = await self.client.send(request, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise VLLMConnectionError("could not connect to vLLM") from exc
+        if response.is_error:
+            status_code = response.status_code
+            await response.aclose()
+            raise VLLMUpstreamError(status_code)
+        return VLLMStream(
+            response,
+            started=started,
+            on_first_token=on_first_token,
+            on_done=on_done,
+        )
+
+    async def stream_completion(self, **kwargs: Any) -> AsyncIterator[bytes]:
+        stream = await self.open_stream_completion(**kwargs)
+        async for chunk in stream:
+            yield chunk
+
+    @staticmethod
+    def _payload(
+        *,
+        model: str,
+        prompt: Prompt,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: str | list[str] | None,
+        stream: bool,
+        cache_salt: str | None,
+        extra_body: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        extra_body = extra_body or {}
+        reserved = sorted(RESERVED_EXTRA_FIELDS.intersection(extra_body))
+        if reserved:
+            raise ValueError(f"extra_body contains reserved fields: {', '.join(reserved)}")
         payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
-            "stream": True,
+            "stream": stream,
+            **extra_body,
         }
         if stop:
             payload["stop"] = stop
-        if extra_body:
-            payload.update(extra_body)
+        if cache_salt is not None:
+            payload["cache_salt"] = cache_salt
+        return payload
 
-        started = time.perf_counter()
-        first_token_seen = False
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST",
-                f"{worker_url.rstrip('/')}/v1/completions",
-                json=payload,
-                timeout=self.timeout_seconds,
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line:
-                        yield b"\n"
-                        continue
-                    if not first_token_seen and self._line_has_token(line):
-                        first_token_seen = True
-                        ttft_ms = (time.perf_counter() - started) * 1000
-                        if on_first_token:
-                            on_first_token(ttft_ms)
-                    yield f"{line}\n\n".encode()
-        latency_ms = (time.perf_counter() - started) * 1000
-        if on_done:
-            on_done(latency_ms)
+    @staticmethod
+    def line_has_token(line: str) -> bool:
+        if not line.startswith("data:"):
+            return False
+        data = line.removeprefix("data:").strip()
+        return VLLMClient.data_has_token(data)
 
-    def _line_has_token(self, line: str) -> bool:
-        if not line.startswith("data: "):
-            return bool(line.strip())
-        data = line.removeprefix("data: ").strip()
+    @staticmethod
+    def data_has_token(data: str) -> bool:
+        if not data:
+            return False
         if data == "[DONE]":
             return False
         try:
             payload = json.loads(data)
         except json.JSONDecodeError:
             return False
-        for choice in payload.get("choices") or []:
-            if choice.get("text"):
-                return True
-        return False
+        return any(choice.get("text") for choice in payload.get("choices") or [])
