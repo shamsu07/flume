@@ -15,6 +15,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from starlette.background import BackgroundTask
 
 from flume.compiler import ContextPackCompiler
 from flume.config import INSECURE_CACHE_SALT_SECRET, Settings, get_settings
@@ -44,7 +45,7 @@ from flume.models import (
     WarmResponse,
     WorkerStats,
 )
-from flume.router import NoHealthyWorkers, PackRouter, WarmupSingleFlight
+from flume.router import NoHealthyWorkers, PackRouter, WarmupSingleFlight, WorkerLease
 from flume.store import ByteBoundedPackCache, FlumeStore, PackConflictError
 from flume.vllm import (
     CompletionResult,
@@ -77,6 +78,52 @@ class AdmissionController:
             IN_FLIGHT.dec()
 
 
+class ManagedCompletionStream:
+    """Own an upstream stream and finalize request accounting exactly once."""
+
+    def __init__(
+        self,
+        stream: VLLMStream,
+        admission: AdmissionController,
+        worker_url: str,
+    ):
+        self.stream = stream
+        self.admission = admission
+        self.worker_url = worker_url
+        self._iterator = stream.__aiter__()
+        self._closed = False
+
+    def __aiter__(self) -> ManagedCompletionStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await anext(self._iterator)
+        except StopAsyncIteration:
+            await self.aclose(outcome="ok")
+            raise
+        except asyncio.CancelledError:
+            await self.aclose(outcome="cancelled")
+            raise
+        except Exception:
+            await self.aclose(outcome="failed")
+            raise
+
+    async def aclose(self, *, outcome: str = "cancelled") -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.stream.aclose()
+        finally:
+            ASKS_TOTAL.labels(
+                worker_id=_worker_id(self.worker_url),
+                stream="true",
+                outcome=outcome,
+            ).inc()
+            self.admission.release()
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -91,12 +138,22 @@ def create_app(
     vllm = VLLMClient(
         timeout_seconds=settings.request_timeout_seconds,
         connect_timeout_seconds=settings.connect_timeout_seconds,
+        health_timeout_seconds=settings.health_timeout_seconds,
         transport=vllm_transport,
     )
     router = PackRouter(
         settings.vllm_workers,
         health_checker=vllm.health,
+        load_checker=vllm.load if settings.routing_policy == "bounded_hrw" else None,
         refresh_seconds=settings.health_refresh_seconds,
+        load_refresh_seconds=settings.worker_load_refresh_ms / 1_000,
+        load_stale_seconds=settings.worker_load_stale_ms / 1_000,
+        routing_policy=settings.routing_policy,
+        load_slack=settings.routing_load_slack,
+        spill_hold_seconds=settings.routing_spill_hold_ms / 1_000,
+        capacity_weights=settings.worker_capacity_weights,
+        state_max_entries=settings.routing_state_max_entries,
+        state_ttl_seconds=settings.routing_state_ttl_seconds,
     )
     cache = ByteBoundedPackCache(settings.pack_cache_bytes)
     warmups: WarmupSingleFlight[tuple[CompletionResult, str]] = WarmupSingleFlight()
@@ -104,26 +161,30 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await store.init_schema()
-        await vllm.start()
-        app.state.compiler_error = None
-        if app.state.compiler is None:
-            try:
-                app.state.compiler = ContextPackCompiler.from_pretrained(
-                    tokenizer_id=settings.tokenizer_id,
-                    tokenizer_revision=settings.tokenizer_revision,
-                    model_id=settings.model_id,
-                    allow_remote_tokenizer=settings.allow_remote_tokenizer,
-                )
-            except Exception:
-                app.state.compiler_error = "configured tokenizer could not be loaded"
-        await router.start()
         try:
+            await store.init_schema()
+            await vllm.start()
+            app.state.compiler_error = None
+            if app.state.compiler is None:
+                try:
+                    app.state.compiler = ContextPackCompiler.from_pretrained(
+                        tokenizer_id=settings.tokenizer_id,
+                        tokenizer_revision=settings.tokenizer_revision,
+                        model_id=settings.model_id,
+                        allow_remote_tokenizer=settings.allow_remote_tokenizer,
+                    )
+                except Exception:
+                    app.state.compiler_error = "configured tokenizer could not be loaded"
+            await router.start()
             yield
         finally:
-            await router.close()
-            await vllm.close()
-            await store.close()
+            try:
+                await router.close()
+            finally:
+                try:
+                    await vllm.close()
+                finally:
+                    await store.close()
 
     app = FastAPI(
         title="Flume",
@@ -335,12 +396,15 @@ def create_app(
                 )
                 metric_worker = _worker_id(actual_worker)
                 headers["X-Flume-Worker-Id"] = metric_worker
-                stream_handed_off = True
-                return StreamingResponse(
-                    _stream_with_release(stream, admission, actual_worker),
+                managed_stream = _stream_with_release(stream, admission, actual_worker)
+                response = StreamingResponse(
+                    managed_stream,
                     media_type="text/event-stream",
                     headers=headers,
+                    background=BackgroundTask(managed_stream.aclose),
                 )
+                stream_handed_off = True
+                return response
 
             started = time.perf_counter()
             result, actual_worker = await _complete_with_failover(
@@ -407,17 +471,20 @@ def create_app(
         health = router.health()
         workers = []
         for worker in settings.vllm_workers:
-            counts = route_counts.get(
-                worker,
-                {"assigned_packs": 0, "affinity_hits": 0, "affinity_misses": 0},
-            )
+            counts = route_counts[worker]
             workers.append(
                 WorkerStats(
                     worker_id=_worker_id(worker),
                     healthy=health.get(worker),
-                    assigned_packs=counts["assigned_packs"],
-                    affinity_hits=counts["affinity_hits"],
-                    affinity_misses=counts["affinity_misses"],
+                    assigned_packs=counts.assigned_packs,
+                    affinity_hits=counts.affinity_hits,
+                    affinity_misses=counts.affinity_misses,
+                    local_in_flight=counts.local_in_flight,
+                    upstream_running=counts.upstream_running,
+                    upstream_waiting=counts.upstream_waiting,
+                    effective_load=counts.effective_load,
+                    load_fresh=counts.load_fresh,
+                    capacity_weight=counts.capacity_weight,
                 )
             )
         return StatsResponse(packs=pack_count, routes=route_count, workers=workers)
@@ -488,35 +555,30 @@ async def _complete_with_failover(
     extra_body: dict[str, Any] | None,
     cache_salt: str,
 ) -> tuple[CompletionResult, str]:
+    async def complete(target_worker: str) -> CompletionResult:
+        lease = router.acquire(target_worker)
+        try:
+            return await vllm.complete(
+                worker_url=target_worker,
+                model=model,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                extra_body=extra_body,
+                cache_salt=cache_salt,
+            )
+        finally:
+            lease.release()
+
     try:
-        result = await vllm.complete(
-            worker_url=worker_url,
-            model=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop,
-            extra_body=extra_body,
-            cache_salt=cache_salt,
-        )
-        return result, worker_url
+        return await complete(worker_url), worker_url
     except VLLMConnectionError:
         ROUTER_FAILOVERS.labels(operation="completion").inc()
         router.mark_unhealthy(worker_url)
         replacement = await router.choose(pack_id, exclude={worker_url})
-        result = await vllm.complete(
-            worker_url=replacement,
-            model=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop,
-            extra_body=extra_body,
-            cache_salt=cache_salt,
-        )
-        return result, replacement
+        return await complete(replacement), replacement
 
 
 async def _open_stream_with_failover(
@@ -531,19 +593,24 @@ async def _open_stream_with_failover(
     cache_salt: str,
 ) -> tuple[VLLMStream, str]:
     async def open_stream(target_worker: str) -> VLLMStream:
-        return await vllm.open_stream_completion(
-            worker_url=target_worker,
-            model=model,
-            prompt=prompt,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            stop=request.stop,
-            extra_body=request.extra_body,
-            cache_salt=cache_salt,
-            on_first_token=lambda value: TTFT.observe(value / 1000),
-            on_done=lambda value: ASK_LATENCY.observe(value / 1000),
-        )
+        lease = router.acquire(target_worker)
+        try:
+            return await vllm.open_stream_completion(
+                worker_url=target_worker,
+                model=model,
+                prompt=prompt,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=request.stop,
+                extra_body=request.extra_body,
+                cache_salt=cache_salt,
+                on_first_token=lambda value: TTFT.observe(value / 1000),
+                on_done=lambda value: _finish_worker_stream(lease, value),
+            )
+        except BaseException:
+            lease.release()
+            raise
 
     try:
         stream = await open_stream(worker_url)
@@ -556,28 +623,17 @@ async def _open_stream_with_failover(
         return stream, replacement
 
 
-async def _stream_with_release(
+def _finish_worker_stream(lease: WorkerLease, latency_ms: float) -> None:
+    ASK_LATENCY.observe(latency_ms / 1000)
+    lease.release()
+
+
+def _stream_with_release(
     stream: VLLMStream,
     admission: AdmissionController,
     worker_url: str,
-) -> AsyncIterator[bytes]:
-    outcome = "ok"
-    try:
-        async for chunk in stream:
-            yield chunk
-    except asyncio.CancelledError:
-        outcome = "cancelled"
-        raise
-    except Exception:
-        outcome = "failed"
-        raise
-    finally:
-        ASKS_TOTAL.labels(
-            worker_id=_worker_id(worker_url),
-            stream="true",
-            outcome=outcome,
-        ).inc()
-        admission.release()
+) -> ManagedCompletionStream:
+    return ManagedCompletionStream(stream, admission, worker_url)
 
 
 def _worker_id(worker_url: str) -> str:
